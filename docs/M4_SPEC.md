@@ -24,10 +24,14 @@ tests that run only when `ACADE2SQL_TEST_PG_URL` / `ACADE2SQL_TEST_MSSQL_URL` ar
   are already ≤ 60.
 * **PostgreSQL NUL**: text containing `\x00` cannot be stored in PG → that table `error` with message
   `"write failed: NUL character in text column <C> (not supported by PostgreSQL)"`.
-* **Case-insensitive targets** (mssql default collation): no special handling; documented risk.
+* **Case-insensitive targets** (mssql default collation): full/append need no special handling; sync
+  detects keys the target's collation merges (case / trailing spaces) and fails that table with a
+  "collation ... re-run with --mode full" error, target unchanged (DECISIONS #25, review gate 2).
 * **`--schema NAME`** (API `schema: str | None = None`): all tables/indexes are created in that schema
   (`MetaData(schema=...)`). SQLite: `ValueError`/exit 2 if given (not supported). The schema must already
-  exist (no CREATE SCHEMA) — missing schema → table errors with the DB message.
+  exist (no CREATE SCHEMA) — missing schema → table errors with the DB message. One plain name only:
+  empty/whitespace names or names containing `.`, `[`, `]`, `"`, a backtick or a control character →
+  `UsageError`, exit 2 (review gate 2).
 
 ## 3. Modes (`mode: Literal["full", "append", "sync"]`, CLI `--mode`)
 Common: for `append`/`sync`, a missing target table is created (as in full). An existing target table is
@@ -61,6 +65,9 @@ target unchanged). Checksum is not computed in append (`checksum_match=None`, wa
   source checksum to the checksum of target rows **restricted to the source keys**; always check
   `count(target rows with key in source keys) == source_rows`. With `--delete-missing` also
   `target_rows == source_rows`; without it, extra target rows are reported (`extra_rows`) but don't fail.
+  Values are compared column-aware (DECISIONS #36: GUID folding only in GUID columns, REAL at float32).
+  Before commit the sync verifies its own counters on the same connection (DECISIONS #25); a mismatch is
+  `write failed: sync verification failed: ...` and the table is rolled back.
 * Idempotency: a second identical sync → `inserted=0, updated=0, deleted=0`, all pass.
 
 ## 4. `--dry-run` (API `dry_run: bool = False`)
@@ -68,14 +75,16 @@ Reads the source schema (and row counts unless `--no-counts`), **never connects 
 (dialect from the URL via `sqlalchemy.create_mock_engine`, no DBAPI import needed), and prints:
 the plan (mode, target masked, schema, per table: name, rows, key used for sync, actions: drop/create or
 create-if-missing, warnings such as skipped mssql indexes) and the full DDL (`CREATE TABLE` + `CREATE
-INDEX`, and `DROP TABLE` for full) for the target dialect. Exit 0. The report (if `--report`) has
-`dry_run: true`, statuses `"planned"`, and `ok` true. Works for sqlite, mssql and postgresql URLs even if
-psycopg/ODBC Driver 18 are not installed.
+INDEX`, and `DROP TABLE IF EXISTS` for full) for the target dialect. Exit 0. The report (if `--report`)
+has `dry_run: true`, statuses `"planned"`, and `ok` true. Exceptions (review gate 2): planning errors are
+`error`, and a table with an unmapped Access type is `fail` (as in the real run, DECISIONS #21), so the
+dry run then exits 3. A table without a sync key reports `key: null`. Works for sqlite, mssql and
+postgresql URLs even if psycopg/ODBC Driver 18 are not installed.
 
 ## 5. CLI additions
 `--mode {full,append,sync}`, `--key SPEC` (repeatable), `--no-key {error,replace}`, `--delete-missing`,
-`--schema NAME`, `--dry-run`, `--no-counts` (dry-run only). Invalid combos (`--delete-missing` without
-sync, `--key` without sync, `--schema` with SQLite) → exit 2 with a message. `render_text` shows the new
+`--schema NAME`, `--dry-run`, `--no-counts` (dry-run only). Invalid combos (`--delete-missing`, `--key`
+or `--no-key` without sync, `--schema` with SQLite or an invalid schema name) → exit 2 with a message. `render_text` shows the new
 counters for append/sync, e.g. `PASS COMP source=120 target=125 inserted=3 updated=2 deleted=0 extra=5`.
 
 ## 6. Acceptance (re-verified by the lead)

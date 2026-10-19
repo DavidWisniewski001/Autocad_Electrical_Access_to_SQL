@@ -12,11 +12,13 @@ from typing import Any, TextIO
 
 from acade2sql import __version__
 from acade2sql.converter import TARGET_ENV, convert
-from acade2sql.errors import Acade2SqlError
+from acade2sql.errors import Acade2SqlError, UsageError
+from acade2sql.keys import NO_KEY_CHOICES
 from acade2sql.logging_setup import configure_logging
 from acade2sql.readers import Reader, open_reader
 from acade2sql.redact import redact
 from acade2sql.schema import TableInfo
+from acade2sql.writers.sqlalchemy_writer import MODES
 
 log = logging.getLogger("acade2sql.cli")
 
@@ -71,11 +73,36 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL|PATH",
         help=f"SQLAlchemy URL or .sqlite/.db path (default: ${TARGET_ENV}, else ./<source>.sqlite)",
     )
-    conv.add_argument("--mode", choices=["full"], default="full", help="write mode (default: full)")
-    conv.add_argument("--tables", nargs="+", metavar="T", help="only these tables")
-    conv.add_argument("--exclude", nargs="+", metavar="T", help="skip these tables")
     conv.add_argument(
-        "--batch-size", type=_positive_int, default=5000, metavar="N", help="rows per batch"
+        "--mode",
+        choices=list(MODES),
+        default="full",
+        help="full: drop+create+load; append: insert rows; sync: upsert by key (default: full)",
+    )
+    # `--tables A B`, `--tables A --tables B` and `--tables A,B` all work. The list is greedy:
+    # put the source path before --tables/--exclude.
+    conv.add_argument(
+        "--tables",
+        nargs="+",
+        action="extend",
+        type=_name_list,
+        metavar="T",
+        help="only these tables (space/comma-separated, repeatable; give the source first)",
+    )
+    conv.add_argument(
+        "--exclude",
+        nargs="+",
+        action="extend",
+        type=_name_list,
+        metavar="T",
+        help="skip these tables (space/comma-separated, repeatable)",
+    )
+    conv.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=5000,
+        metavar="N",
+        help="rows per batch (default: %(default)s)",
     )
     conv.add_argument(
         "--checksum", action="store_true", help="compare row checksums (re-reads every table)"
@@ -84,7 +111,48 @@ def _build_parser() -> argparse.ArgumentParser:
         "--copy-to-temp", action="store_true", help="read from a temporary copy of the source"
     )
     conv.add_argument("--report", metavar="PATH.json", help="write the JSON report here")
+    conv.add_argument(
+        "--key",
+        action="append",
+        metavar="SPEC",
+        help="sync key: COL[,COL...] for every table having those columns, or "
+        "TABLE=COL[,COL...] (repeatable; default: the table's primary key)",
+    )
+    conv.add_argument(
+        "--no-key",
+        choices=list(NO_KEY_CHOICES),
+        default=None,
+        help="sync of a table without key: error (default) or replace all its rows",
+    )
+    conv.add_argument(
+        "--delete-missing",
+        action="store_true",
+        help="sync: delete target rows whose key is not in the source",
+    )
+    conv.add_argument("--schema", metavar="NAME", help="existing target schema (not SQLite)")
+    conv.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the plan and DDL; never connect to the target",
+    )
+    conv.add_argument(
+        "--no-counts",
+        dest="counts",
+        action="store_false",
+        help="--dry-run: do not count source rows",
+    )
     return parser
+
+
+def _name_list(text: str) -> list[str]:
+    names = [n.strip() for n in text.split(",")]
+    if any(not n for n in names):
+        raise argparse.ArgumentTypeError(f"empty table name in {text!r}")
+    return names
+
+
+def _flatten(groups: list[list[str]] | None) -> list[str] | None:
+    return None if groups is None else [n for group in groups for n in group]
 
 
 def _positive_int(text: str) -> int:
@@ -167,21 +235,32 @@ def _cmd_inspect(args: argparse.Namespace, out: TextIO) -> int:
 
 def _cmd_convert(args: argparse.Namespace, out: TextIO) -> int:
     started = time.perf_counter()
+    if args.no_key is not None and args.mode != "sync":
+        raise UsageError("--no-key requires --mode sync")
     report = convert(
         args.source,
         args.target,
         mode=args.mode,
-        tables=args.tables,
-        exclude=args.exclude,
+        tables=_flatten(args.tables),
+        exclude=_flatten(args.exclude),
         batch_size=args.batch_size,
         checksum=args.checksum,
         copy_to_temp=args.copy_to_temp,
         report_path=args.report,
+        key=args.key,
+        no_key=args.no_key or "error",
+        delete_missing=args.delete_missing,
+        schema=args.schema,
+        dry_run=args.dry_run,
+        counts=args.counts,
     )
     elapsed = time.perf_counter() - started
     if not report.tables:
         sys.stderr.write("warning: no tables selected\n")
     out.write(report.render_text() + "\n")
+    if report.dry_run:
+        sys.stderr.write(f"dry run: target={report.target} elapsed={elapsed:.1f}s\n")
+        return EXIT_OK if report.ok else EXIT_VALIDATION
     rows = sum(t.target_rows or 0 for t in report.tables)
     rate = round(rows / elapsed) if elapsed > 0 else rows
     sys.stderr.write(
@@ -203,6 +282,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "inspect":
             return _cmd_inspect(args, sys.stdout)
         return _cmd_convert(args, sys.stdout)
+    except UsageError as exc:
+        sys.stderr.write(f"error: {redact(str(exc), getattr(args, 'target', None))}\n")
+        return EXIT_USAGE
     except Acade2SqlError as exc:
         target = getattr(args, "target", None)
         if verbose:

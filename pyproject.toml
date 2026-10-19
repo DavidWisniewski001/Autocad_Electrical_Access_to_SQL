@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "acade2sql"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert AutoCAD Electrical Access databases (.mdb/.accdb) to SQL via SQLAlchemy"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.4"]
 fallback = ["access-parser"]
+postgresql = ["psycopg[binary]>=3.1"]
+# SQL Server uses pyodbc (a core dependency) + Microsoft "ODBC Driver 17/18 for SQL Server".
+mssql = []
 
 [project.scripts]
 acade2sql = "acade2sql.cli:main"

@@ -163,7 +163,7 @@ def translate_connect_error(exc: pyodbc.Error) -> Acade2SqlError:
         return SourceNotFoundError(f"The Access driver could not open the file: {text}")
     if "already in use" in lowered or "exclusively locked" in lowered:
         return Acade2SqlError(
-            f"The database is locked by another program (close Access/AutoCAD Electrical, or use "
-            f"copy_to_temp): {text}"
+            f"The database is locked by another program (close Access/AutoCAD Electrical, or read "
+            f"a copy: --copy-to-temp on the command line, copy_to_temp=True in the API): {text}"
         )
     return Acade2SqlError(f"Could not open the Access database (SQLSTATE {state or '?'}): {text}")

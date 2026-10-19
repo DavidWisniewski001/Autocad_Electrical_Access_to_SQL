@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,10 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "access_driver: alias of requires_driver")
     config.addinivalue_line("markers", "real_data: runs against data_files/*.mdb|accdb")
     config.addinivalue_line("markers", "slow: long-running test")
+    config.addinivalue_line(
+        "markers",
+        "live_db: needs a live server (ACADE2SQL_TEST_PG_URL / ACADE2SQL_TEST_MSSQL_URL)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -66,3 +71,72 @@ def reader(access_db):
 
     with open_reader(access_db) as r:
         yield r
+
+
+# ---- M4 fixtures ---------------------------------------------------------------------------------
+
+
+def _env_url(var: str) -> str:
+    url = os.environ.get(var, "").strip()
+    if not url:
+        pytest.skip(f"{var} not set")
+    return url
+
+
+@pytest.fixture
+def pg_url() -> str:
+    return _env_url("ACADE2SQL_TEST_PG_URL")
+
+
+@pytest.fixture
+def mssql_url() -> str:
+    return _env_url("ACADE2SQL_TEST_MSSQL_URL")
+
+
+@pytest.fixture
+def install_reader(monkeypatch):
+    """Make ``converter.open_reader`` return the given in-memory reader."""
+    from acade2sql import converter
+
+    def install(reader):
+        monkeypatch.setattr(converter, "open_reader", lambda *a, **k: reader)
+        return reader
+
+    return install
+
+
+def patch_writer(mp, generic: bool, dialect: str | None = None):
+    """Wrap ``converter.SqlAlchemyWriter`` so every writer gets ``_force_generic_sync``.
+
+    With ``dialect`` the writer (and its engine's dialect instance) is made to *report* that
+    dialect name while still talking to SQLite; used to exercise dialect-name-gated checks.
+    """
+    from acade2sql import converter
+
+    real = converter.SqlAlchemyWriter
+
+    def factory(*a, **k):
+        w = real(*a, **k)
+        w._force_generic_sync = generic
+        if dialect:
+            w.dialect = dialect
+            w.engine.dialect.name = dialect
+        return w
+
+    mp.setattr(converter, "SqlAlchemyWriter", factory)
+
+
+@pytest.fixture(params=["native", "generic"])
+def impl(request, monkeypatch):
+    """Sync implementation under test: 'generic' sets writer._force_generic_sync=True."""
+    patch_writer(monkeypatch, request.param == "generic")
+    return request.param
+
+
+@pytest.fixture(scope="session")
+def accdb_original(tmp_path_factory) -> Path:
+    """Session .accdb fixture for the M4 sync tests. NEVER modified (tests copy it)."""
+    if not build_access.driver_available():
+        pytest.skip("Access ODBC driver not available")
+    d = tmp_path_factory.mktemp("fx_m4")
+    return build_access.build(d / "orig.accdb")

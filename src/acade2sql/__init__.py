@@ -17,7 +17,7 @@ from acade2sql.redact import mask_url, redact
 from acade2sql.schema import ColumnInfo, IndexInfo, TableInfo
 from acade2sql.validate import Report, TableResult
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Acade2SqlError",

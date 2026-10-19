@@ -50,9 +50,9 @@ input in the requirements, so the test-engineer will build a synthetic ACADE-lik
 | M2 | Project skeleton (`pyproject.toml`, `src/acade2sql/`), `Reader` interface, pyodbc reader, driver/bitness diagnostics (dev); pytest harness and synthetic fixtures (test) | python-converter-dev, test-engineer | `pip install -e .` works; `acade2sql inspect data_files/default_cat.mdb` lists all 168 tables with columns; tests and `ruff check` pass | **Done 2026-10-18**: 271 tests pass, verified independently |
 | M3 | `typemap.py`, `schema.py`, SQLAlchemy writer, SQLite target, `full` mode, `validate.py` report | dev + test | Both sample DBs convert to SQLite with every table's row count matching; NULL/`''`/unicode/date round-trip tests pass; JSON report written; exit code non-zero on an injected mismatch | **Done 2026-10-19**: 663 tests; catalog 168/168 and footprint 117/117 tables pass with checksums; verified independently |
 | — | **Review gate 1** | code-reviewer | Confirmed findings fixed and re-verified | **Done 2026-10-19**: 4 major + 7 minor + 5 nits fixed, each with regression tests |
-| M4 | MSSQL and PostgreSQL dialects, `append`/`sync`, `--dry-run` | dev + test | DDL generated for all three dialects (tested via SQLAlchemy compile; live servers optional); sync is idempotent on re-run | Pending |
+| M4 | MSSQL and PostgreSQL dialects, `append`/`sync`, `--dry-run` | dev + test | DDL generated for all three dialects (tested via SQLAlchemy compile; live servers optional); sync is idempotent on re-run | **Done 2026-10-19** (v0.2.0): 902 tests; real catalog sync verified (tamper → exact counters, delete-missing, idempotent re-sync). SQL Server/PostgreSQL verified by SQL compilation and dry-run only; live tests env-gated (`ACADE2SQL_TEST_PG_URL` / `ACADE2SQL_TEST_MSSQL_URL`) |
 | M5 | `access-parser` fallback reader, CLI polish, README | dev | The fallback reader gives the same table/row counts as pyodbc on the samples; README covers the driver redistributable and bitness | Pending |
-| — | **Review gate 2** | code-reviewer | As above | Pending |
+| — | **Review gate 2** | code-reviewer | Confirmed findings fixed and re-verified | **Done for M4 2026-10-19**: 2 major + 5 minor + 5 nits fixed (120 regression tests); repeat after M5 |
 
 ## Module interfaces (draft; finalised in M2)
 
@@ -92,6 +92,18 @@ cli.py               convert | inspect
 | Primary key | `RECNUM` as the target PK, values copied as-is | Only column that is reliably unique |
 | Sync key | RECNUM by default; `--key` override; natural keys created as non-unique indexes | No reliable natural key in large family tables |
 | MEMO | `TEXT` / `NVARCHAR(MAX)` / `TEXT`, never `NVARCHAR(1073741823)` | Declared size is 1 GB |
+
+## M5 backlog (found while documenting 0.2.0; none affect data)
+
+- `redact()` masks every occurrence of a short password inside any message (password `p` turns
+  "plain" into "***lain"). Mask only structured positions (URL userinfo, `PWD=`, query values) plus
+  occurrences of secrets of 4 or more characters.
+- Dry-run lists `replace-rows` for keyless tables under `--no-key error`, where the real run errors.
+- `--tables`/`--exclude` always split on commas, so a table name containing `,` can't be selected
+  (add an escape or a `--tables-file`).
+- Export `UsageError`, `SchemaError`, `SyncKeyError` and `TargetDataError` from `acade2sql`.
+- `--checksum` with `--dry-run` is silently ignored; decide between a warning and exit 2.
+- Live verification against a real SQL Server and PostgreSQL (needs a server from the user).
 
 ## Risks and open questions
 

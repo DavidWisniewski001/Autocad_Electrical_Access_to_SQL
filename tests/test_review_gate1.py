@@ -124,7 +124,8 @@ def test_convert_is_a_plain_function_and_old_module_is_gone():
     params = inspect.signature(acade2sql.convert).parameters
     assert list(params) == [
         "source", "target", "mode", "tables", "exclude", "batch_size", "checksum",
-        "copy_to_temp", "report_path",
+        "copy_to_temp", "report_path", "key", "no_key", "delete_missing", "schema", "dry_run",
+        "counts",
     ]  # fmt: skip
     assert params["mode"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["report_path"].kind is inspect.Parameter.KEYWORD_ONLY
@@ -520,7 +521,8 @@ G = "6F9619FF-8B86-D011-B42D-00C04FC964FF"
 
 
 def ck(*values):
-    return table_checksum([[(v,) for v in values]])
+    """Checksum of one GUID column (GUID folding is column-aware since review gate 2)."""
+    return table_checksum([[(v,) for v in values]], column_types=["GUID"])
 
 
 def test_checksum_unbalanced_guid_braces_differ():

@@ -185,21 +185,22 @@ ALIASES: dict[str, str] = {
 _warned_unknown: set[str] = set()
 
 
-def _canonical(access_type: str) -> str:
+def canonical_type(access_type: str | None) -> str:
+    """The :data:`TYPE_MAP` key of ``access_type`` (upper-cased, aliases resolved)."""
     key = (access_type or "").strip().upper()
     return ALIASES.get(key, key)
 
 
 def is_known(access_type: str) -> bool:
     """True if ``access_type`` (or one of its aliases) has an entry in :data:`TYPE_MAP`."""
-    return _canonical(access_type) in TYPE_MAP
+    return canonical_type(access_type) in TYPE_MAP
 
 
 def sa_type(col: ColumnInfo, dialect: str) -> sat.TypeEngine:
     """SQLAlchemy type for ``col`` on ``dialect``; unknown Access types become unbounded text."""
     if dialect not in DIALECTS:
         raise ValueError(f"unsupported dialect {dialect!r}; expected one of {DIALECTS}")
-    rule = TYPE_MAP.get(_canonical(col.access_type))
+    rule = TYPE_MAP.get(canonical_type(col.access_type))
     if rule is None:
         if col.access_type not in _warned_unknown:
             _warned_unknown.add(col.access_type)

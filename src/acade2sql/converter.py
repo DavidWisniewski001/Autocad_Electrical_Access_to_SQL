@@ -5,26 +5,36 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, TypeVar
 
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
-from acade2sql.errors import TableNotFoundError, WriteError
+from acade2sql import plan
+from acade2sql.errors import TableNotFoundError, UsageError
+from acade2sql.keys import NO_KEY_CHOICES, KeySpec, parse_key_specs, unmatched_tables
+from acade2sql.modes import (
+    RUNNERS,
+    Mode,
+    NoKey,
+    ReadFailed,
+    RunOptions,
+    error_text,
+    unmapped_type_warnings,
+)
 from acade2sql.readers import Reader, open_reader
-from acade2sql.redact import redact
+from acade2sql.redact import mask_url
 from acade2sql.schema import TableInfo
-from acade2sql.typemap import is_known
-from acade2sql.validate import Report, Status, TableResult, table_checksum, utc_now
+from acade2sql.validate import Report, TableResult, utc_now
 from acade2sql.writers import SqlAlchemyWriter
+from acade2sql.writers.dialects import check_pg_identifiers
+from acade2sql.writers.sqlalchemy_writer import MODES, check_schema_name
 
 log = logging.getLogger(__name__)
 
 TARGET_ENV = "ACADE2SQL_TARGET"
 SQLITE_SUFFIXES = frozenset({".sqlite", ".db", ".sqlite3"})
-
-_T = TypeVar("_T")
 
 
 def _sqlite_url(path: Path) -> str:
@@ -76,121 +86,42 @@ def select_tables(
     return selected
 
 
-def unmapped_type_warnings(info: TableInfo) -> list[str]:
-    """One warning per column whose Access type has no TYPE_MAP entry (stored as text)."""
-    return [
-        f"unmapped type {c.access_type} in column {c.name} stored as text"
-        for c in sorted(info.columns, key=lambda c: c.ordinal)
-        if not is_known(c.access_type)
-    ]
-
-
-class _ReadFailed(Exception):
-    """Internal marker: the source side (Access reader) raised ``cause``."""
-
-    def __init__(self, cause: BaseException) -> None:
-        super().__init__(str(cause))
-        self.cause = cause
-
-
-class _SourceBatches:
-    """Iterate the reader's batches, remembering an exception raised by the source."""
-
-    def __init__(self, open_batches: Callable[[], Iterable[list[tuple]]]) -> None:
-        self._open = open_batches
-        self.error: BaseException | None = None
-
-    def __iter__(self) -> Iterator[list[tuple]]:
-        try:
-            yield from self._open()
-        except Exception as exc:
-            self.error = exc
-            raise
-
-
-def _read(fn: Callable[[], _T]) -> _T:
-    try:
-        return fn()
-    except Exception as exc:
-        raise _ReadFailed(exc) from exc
-
-
-def _error_text(exc: BaseException, url: URL | str | None) -> str:
-    """``read failed: ...`` or ``write failed: ...`` with secrets redacted."""
-    if isinstance(exc, _ReadFailed):
-        cause = exc.cause
-        return f"read failed: {type(cause).__name__}: {redact(str(cause), url)}"
-    if isinstance(exc, WriteError):
-        return f"write failed: {exc.detail}"
-    return f"write failed: {type(exc).__name__}: {redact(str(exc), url)}"
-
-
 def _convert_table(
-    reader: Reader,
-    writer: SqlAlchemyWriter,
-    info: TableInfo,
-    batch_size: int,
-    checksum: bool,
+    reader: Reader, writer: SqlAlchemyWriter, info: TableInfo, opts: RunOptions
 ) -> TableResult:
-    """create_table + load + verify one table; every failure becomes ``status="error"``."""
+    """Run the mode for one table; every failure becomes ``status="error"``."""
     started = time.perf_counter()
-    warnings = unmapped_type_warnings(info)
-    source_rows: int | None = None
-    target_rows: int | None = None
+    unmapped = unmapped_type_warnings(info)
+    res = TableResult(info.name, None, None, "pass", warnings=list(unmapped))
+    written = 0
     try:
-        source_rows = _read(lambda: reader.count_rows(info.name))
-        writer.create_table(info)
-        source = _SourceBatches(lambda: reader.iter_rows(info.name, batch_size))
-        try:
-            written = writer.write_batches(info, source)
-        except WriteError as exc:
-            if source.error is not None:
-                raise _ReadFailed(source.error) from exc
-            raise
-        target_rows = writer.count_rows(info.name)
-        match: bool | None = None
-        if checksum:
-            src_sum = _read(lambda: table_checksum(reader.iter_rows(info.name, batch_size)))
-            match = src_sum == table_checksum(writer.read_rows(info.name, batch_size))
-        status: Status = "pass" if source_rows == target_rows and match is not False else "fail"
-        if warnings:  # DECISIONS #21: an unmapped type always fails the table
-            status = "fail"
+        res.warnings.extend(writer.table_warnings(info))
+        written = RUNNERS[opts.mode](reader, writer, info, opts, res)
+        if unmapped:  # DECISIONS #21: an unmapped type always fails the table
+            res.status = "fail"
     except Exception as exc:
-        error = _error_text(exc, writer.url)
-        log.error("table failed", extra={"kv": {"table": info.name, "error": error}})
-        return TableResult(
-            info.name,
-            source_rows,
-            target_rows,
-            "error",
-            error=error,
-            seconds=time.perf_counter() - started,
-            warnings=warnings,
-        )
-    seconds = time.perf_counter() - started
+        res.status = "error"
+        res.error = error_text(exc, writer.url)
+        res.seconds = time.perf_counter() - started
+        log.error("table failed", extra={"kv": {"table": info.name, "error": res.error}})
+        return res
+    res.seconds = time.perf_counter() - started
     log.info(
         "converted table",
         extra={
             "kv": {
                 "table": info.name,
+                "mode": opts.mode,
                 "rows": written,
-                "seconds": round(seconds, 3),
-                "rows_per_s": round(written / seconds) if seconds > 0 else written,
-                "status": status,
+                "seconds": round(res.seconds, 3),
+                "rows_per_s": round(written / res.seconds) if res.seconds > 0 else written,
+                "status": res.status,
             }
         },
     )
-    for warning in warnings:
+    for warning in res.warnings:
         log.warning(warning, extra={"kv": {"table": info.name}})
-    return TableResult(
-        info.name,
-        source_rows,
-        target_rows,
-        status,
-        seconds=seconds,
-        checksum_match=match,
-        warnings=warnings,
-    )
+    return res
 
 
 def _read_schemas(
@@ -201,60 +132,105 @@ def _read_schemas(
         try:
             infos.append(reader.get_table(name))
         except Exception as exc:
-            error = _error_text(_ReadFailed(exc), None)
+            error = error_text(ReadFailed(exc), None)
             log.error("cannot read schema", extra={"kv": {"table": name, "error": error}})
             results.append(TableResult(name, None, None, "error", error=error))
     return infos
+
+
+def _check_options(
+    mode: str,
+    batch_size: object,
+    key: str | Sequence[str] | None,
+    no_key: str,
+    delete_missing: bool,
+    dry_run: bool,
+    counts: bool,
+) -> KeySpec:
+    if mode not in MODES:
+        raise UsageError(f"unsupported mode {mode!r}; expected one of {', '.join(MODES)}")
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError(f"batch_size must be an integer >= 1, got {batch_size!r}")
+    if no_key not in NO_KEY_CHOICES:
+        raise UsageError(f"no_key must be one of {', '.join(NO_KEY_CHOICES)}, got {no_key!r}")
+    if delete_missing and mode != "sync":
+        raise UsageError("--delete-missing requires --mode sync")
+    if no_key != "error" and mode != "sync":
+        raise UsageError("--no-key requires --mode sync")
+    keys = parse_key_specs(key)
+    if keys and mode != "sync":
+        raise UsageError("--key requires --mode sync")
+    if not counts and not dry_run:
+        raise UsageError("--no-counts is only valid with --dry-run")
+    return keys
+
+
+def _backend(url: str) -> str | None:
+    try:
+        return make_url(url).get_backend_name()
+    except (ArgumentError, ValueError, TypeError):
+        return None  # reported as TargetError when the writer opens it
 
 
 def convert(
     source: str | Path,
     target: str | None = None,
     *,
-    mode: Literal["full"] = "full",
+    mode: Mode = "full",
     tables: Sequence[str] | None = None,
     exclude: Sequence[str] | None = None,
     batch_size: int = 5000,
     checksum: bool = False,
     copy_to_temp: bool = False,
     report_path: str | Path | None = None,
+    key: str | Sequence[str] | None = None,
+    no_key: NoKey = "error",
+    delete_missing: bool = False,
+    schema: str | None = None,
+    dry_run: bool = False,
+    counts: bool = True,
 ) -> Report:
     """Convert ``source`` to ``target`` (see :func:`resolve_target`) and return the report.
 
-    Acade2SqlError subclasses raised before the target is modified (bad source, missing driver,
-    unknown table, bad or unreachable target) propagate. Afterwards each table is dropped,
-    created and loaded in turn; any failure is recorded in that table's result and the run
+    ``mode``: ``full`` (drop + create + load), ``append`` (insert into existing or new tables)
+    or ``sync`` (upsert by ``key``; ``delete_missing`` also deletes target rows whose key is not
+    in the source; ``no_key`` decides what happens to tables without a key). ``key``: specs
+    ``"COL[,COL...]"`` (all tables having those columns) and ``"TABLE=COL[,COL...]"``.
+    ``schema``: target schema (not SQLite). ``dry_run``: plan + DDL, no target connection
+    (``counts=False`` skips the source row counts).
+
+    Invalid option combinations raise :class:`UsageError` (a ``ValueError``) before anything
+    is opened. Acade2SqlError subclasses raised before the target is modified (bad source,
+    missing driver, unknown table, bad or unreachable target, PostgreSQL identifiers > 63 bytes)
+    propagate. Afterwards every failure is recorded in that table's result and the run
     continues. The report is written to ``report_path`` whenever the run gets that far.
     """
-    if mode != "full":
-        raise ValueError(f"unsupported mode {mode!r} (M3 supports only 'full')")
-    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
-        raise ValueError(f"batch_size must be an integer >= 1, got {batch_size!r}")
+    keys = _check_options(mode, batch_size, key, no_key, delete_missing, dry_run, counts)
+    check_schema_name(schema)
     source_path = Path(source)
     url = resolve_target(target, source_path)
+    if schema is not None and _backend(url) == "sqlite":
+        raise UsageError("--schema is not supported for SQLite targets")
+    opts = RunOptions(mode, batch_size, checksum, keys, no_key, delete_missing)
     started = utc_now()
+    ddl: list[str] = []
     with open_reader(source_path, copy_to_temp=copy_to_temp) as reader:
         names = select_tables(reader.list_tables(), tables, exclude)
         if not names:
-            log.warning("no tables selected", extra={"kv": {"source": str(reader.path)}})
+            # INFO, not WARNING: the CLI prints "warning: no tables selected" itself (once).
+            log.info("no tables selected", extra={"kv": {"source": str(reader.path)}})
+        for unknown in unmatched_tables(keys, names):
+            log.warning("--key table not converted", extra={"kv": {"table": unknown}})
         results: list[TableResult] = []
         infos = _read_schemas(reader, names, results)
-        with SqlAlchemyWriter(url) as writer:
-            log.info(
-                "converting",
-                extra={
-                    "kv": {
-                        "source": str(reader.path),
-                        "target": writer.url_masked,
-                        "tables": len(infos),
-                    }
-                },
+        if dry_run:
+            planned, ddl, masked = plan.dry_run(
+                reader, infos, url, opts, schema=schema, counts=counts
             )
-            if infos:
-                writer.prepare(infos, mode=mode)  # no DDL; TargetError if unreachable
-            for info in infos:
-                results.append(_convert_table(reader, writer, info, batch_size, checksum))
-            masked = writer.url_masked
+            results.extend(planned)
+        else:
+            results.extend(_write_all(reader, infos, url, opts, schema))
+            masked = mask_url(url)
     order = {n: i for i, n in enumerate(names)}
     results.sort(key=lambda r: order.get(r.name, len(order)))
     report = Report(
@@ -264,7 +240,32 @@ def convert(
         started=started,
         finished=utc_now(),
         tables=results,
+        dry_run=dry_run,
+        schema=schema,
+        ddl=ddl,
     )
     if report_path is not None:
         report.write_json(report_path)
     return report
+
+
+def _write_all(
+    reader: Reader, infos: Sequence[TableInfo], url: str, opts: RunOptions, schema: str | None
+) -> list[TableResult]:
+    with SqlAlchemyWriter(url, schema=schema) as writer:
+        log.info(
+            "converting",
+            extra={
+                "kv": {
+                    "source": str(reader.path),
+                    "target": writer.url_masked,
+                    "mode": opts.mode,
+                    "tables": len(infos),
+                }
+            },
+        )
+        if writer.dialect == "postgresql":
+            check_pg_identifiers(infos, schema)  # before any target modification
+        if infos:
+            writer.prepare(infos, mode=opts.mode)  # no DDL; TargetError if unreachable
+        return [_convert_table(reader, writer, info, opts) for info in infos]

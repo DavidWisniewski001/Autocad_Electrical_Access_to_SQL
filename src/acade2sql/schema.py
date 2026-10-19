@@ -45,6 +45,11 @@ class TableInfo:
     def column_names(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.columns)
 
+    @property
+    def column_types(self) -> tuple[str, ...]:
+        """``access_type`` of each column in ordinal order (the order rows are read/written)."""
+        return tuple(c.access_type for c in sorted(self.columns, key=lambda c: c.ordinal))
+
     def column(self, name: str) -> ColumnInfo:
         """Return the column called ``name`` (exact match first, then case-insensitive)."""
         for col in self.columns:

@@ -12,7 +12,7 @@ import re
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from sqlalchemy import (
     Column,
@@ -30,10 +30,26 @@ from sqlalchemy import exc as sa_exc
 from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.sql.elements import quoted_name
 
-from acade2sql.errors import TableNotFoundError, TargetError, WriteError
+from acade2sql.errors import (
+    SchemaError,
+    TableNotFoundError,
+    TargetError,
+    UsageError,
+    WriteError,
+)
 from acade2sql.redact import mask_url, redact
 from acade2sql.schema import IndexInfo, TableInfo
 from acade2sql.typemap import DECIMAL_TEXT_SQLITE, DecimalText, sa_type
+from acade2sql.writers.dialects import (
+    MSSQL_INDEX_MAX_BYTES,
+    MSSQL_PK_MAX_BYTES,
+    RowGuard,
+    mssql_key_problem,
+    row_guard,
+)
+
+if TYPE_CHECKING:
+    from acade2sql.writers.sync import SyncSession
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +96,13 @@ def _is_pk_index(idx: IndexInfo, info: TableInfo) -> bool:
 def build_table(
     metadata: MetaData, info: TableInfo, dialect: str, *, used_index_names: set[str]
 ) -> Table:
-    """Build the SQLAlchemy :class:`Table` (columns, PK, indexes) for ``info`` on ``dialect``."""
+    """Build the SQLAlchemy :class:`Table` (columns, PK, indexes) for ``info`` on ``dialect``.
+
+    The table is created in ``metadata.schema`` (if set). On SQL Server an index that cannot be
+    created (an NVARCHAR(max)/VARBINARY(max) column, or a key over 1700 bytes) is left out and
+    described in ``table.info["warnings"]``; a primary key SQL Server cannot index (900 bytes)
+    is described in ``table.info["error"]`` (raised by ``SqlAlchemyWriter`` when creating it).
+    """
     pk = set(info.primary_key)
     columns = [
         Column(
@@ -93,8 +115,18 @@ def build_table(
         for c in sorted(info.columns, key=lambda c: c.ordinal)
     ]
     table = Table(quoted_name(info.name, quote=True), metadata, *columns, quote=True)
+    warnings: list[str] = []
+    table.info["warnings"] = warnings
     if info.primary_key:
-        table.append_constraint(PrimaryKeyConstraint(*(table.c[n] for n in info.primary_key)))
+        pk_cols = [table.c[n] for n in info.primary_key]
+        table.append_constraint(PrimaryKeyConstraint(*pk_cols))
+        if dialect == "mssql":
+            problem = mssql_key_problem(pk_cols, MSSQL_PK_MAX_BYTES)
+            if problem:
+                table.info["error"] = (
+                    f"primary key ({', '.join(info.primary_key)}) cannot be created on SQL "
+                    f"Server: {problem}"
+                )
     for idx in info.indexes:
         if _is_pk_index(idx, info):
             continue
@@ -105,9 +137,17 @@ def build_table(
                 extra={"kv": {"table": info.name, "index": idx.name, "missing": missing}},
             )
             continue
+        idx_cols = [table.c[c] for c in idx.columns]
+        if dialect == "mssql":
+            problem = mssql_key_problem(idx_cols, MSSQL_INDEX_MAX_BYTES)
+            if problem:
+                text = f"index {idx.name} skipped on SQL Server: {problem}"
+                warnings.append(text)
+                log.warning(text, extra={"kv": {"table": info.name}})
+                continue
         Index(
             quoted_name(index_name(info.name, idx.name, used_index_names), quote=True),
-            *(table.c[c] for c in idx.columns),
+            *idx_cols,
             unique=idx.unique,
             info={"source_name": idx.name},
         )
@@ -128,6 +168,90 @@ def _sqlite_on_connect(dbapi_conn: Any, _record: Any) -> None:
 
 _BAD_URL_ERRORS = (sa_exc.ArgumentError, sa_exc.NoSuchModuleError, ValueError, TypeError)
 
+Mode = Literal["full", "append", "sync"]
+MODES: tuple[str, ...] = get_args(Mode)
+
+POSTGRESQL_HINT = "install the PostgreSQL driver: pip install acade2sql[postgresql]"
+MSSQL_HINT = (
+    "SQL Server needs pyodbc (pip install acade2sql[mssql]) and the Microsoft "
+    '"ODBC Driver 18 for SQL Server" (or 17) installed for this Python\'s bitness; name it in '
+    "the URL, e.g. mssql+pyodbc://user:pass@host/db?driver=ODBC+Driver+18+for+SQL+Server"
+)
+_ODBC_DRIVER_MISSING = re.compile(
+    r"IM002|Data source name not found|Can't open lib|driver.*not (found|installed)", re.I
+)
+
+
+def dbapi_hint(backend: str) -> str:
+    """What to install for ``backend`` ('' when there is nothing specific to say)."""
+    return {"postgresql": POSTGRESQL_HINT, "mssql": MSSQL_HINT}.get(backend, "")
+
+
+CONNECT_TIMEOUT_S = 15
+LIBPQ_DRIVERS = frozenset({"psycopg", "psycopg2"})  # accept libpq's ``connect_timeout``
+_SCHEMA_FORBIDDEN = {".": "'.'", "[": "'['", "]": "']'", '"': "'\"'", "`": "'`'"}
+
+
+def check_schema_name(schema: str | None) -> None:
+    """Raise :class:`UsageError` for a ``--schema`` that is not one plain identifier.
+
+    Rejected: empty/whitespace-only names and names containing a dot, square brackets, a double
+    quote, a backtick or a control character. The schema is quoted as ONE identifier, so a dotted
+    or pre-quoted name would not mean what the user expects.
+    """
+    if schema is None:
+        return
+    if not schema.strip():
+        raise UsageError("--schema must not be empty")
+    for ch in schema:
+        if ch in _SCHEMA_FORBIDDEN:
+            bad = _SCHEMA_FORBIDDEN[ch]
+        elif ord(ch) < 32 or 127 <= ord(ch) < 160:
+            bad = f"control character U+{ord(ch):04X}"
+        else:
+            continue
+        raise UsageError(
+            f"invalid --schema {schema!r}: contains {bad}; give one plain schema name "
+            "(it is quoted by acade2sql)"
+        )
+
+
+def _url_sets_timeout(parsed: URL) -> bool:
+    """True when the URL already chooses a connect/login timeout (query key or odbc_connect)."""
+    for key, value in parsed.query.items():
+        values = (value,) if isinstance(value, str) else tuple(value)
+        if "timeout" in key.lower() or (
+            key.lower() == "odbc_connect" and any("timeout" in v.lower() for v in values)
+        ):
+            return True
+    return False
+
+
+def _engine_kwargs(parsed: URL) -> dict[str, Any]:
+    """Engine options per target: mssql+pyodbc ``fast_executemany``; a 15 s connect timeout for
+    server targets unless the URL sets one (an unreachable host otherwise hangs > 60 s)."""
+    backend, driver = parsed.get_backend_name(), parsed.get_driver_name()
+    kwargs: dict[str, Any] = {}
+    if backend == "mssql" and driver == "pyodbc":
+        kwargs["fast_executemany"] = True
+        if not _url_sets_timeout(parsed):
+            kwargs["connect_args"] = {"timeout": CONNECT_TIMEOUT_S}  # ODBC login timeout
+    elif (
+        backend == "postgresql"
+        and _driver_name(parsed) in LIBPQ_DRIVERS
+        and not _url_sets_timeout(parsed)
+    ):
+        kwargs["connect_args"] = {"connect_timeout": CONNECT_TIMEOUT_S}  # libpq keyword
+    return kwargs
+
+
+def _driver_name(parsed: URL) -> str | None:
+    """The DBAPI driver of ``parsed`` (the dialect's default when the URL names none)."""
+    try:
+        return parsed.get_driver_name()
+    except (sa_exc.SQLAlchemyError, ImportError):
+        return None
+
 
 def _create_engine(url: str, echo: bool) -> Engine:
     try:
@@ -142,8 +266,14 @@ def _create_engine(url: str, echo: bool) -> Engine:
         except OSError as exc:
             raise TargetError(f"Cannot create target folder {folder}: {exc}") from exc
     try:
-        engine = create_engine(parsed, echo=echo)
-    except (*_BAD_URL_ERRORS, ImportError) as exc:
+        engine = create_engine(parsed, echo=echo, **_engine_kwargs(parsed))
+    except ImportError as exc:  # the DBAPI module (psycopg, pyodbc, ...) is not installed
+        hint = dbapi_hint(parsed.get_backend_name())
+        raise TargetError(
+            f"Cannot open target {mask_url(parsed)}: {redact(str(exc), parsed)}"
+            + (f". {hint}" if hint else "")
+        ) from None
+    except _BAD_URL_ERRORS as exc:
         raise TargetError(
             f"Cannot open target {mask_url(parsed)}: {redact(str(exc), parsed)}"
         ) from None
@@ -157,21 +287,74 @@ def _create_engine(url: str, echo: bool) -> Engine:
     return engine
 
 
+def schema_drift(table: Table, target_columns: Sequence[dict[str, Any]]) -> str | None:
+    """Why the existing target table cannot receive ``table``'s columns (None: it can).
+
+    Every source column must exist in the target (exact name). A target NOT NULL column without
+    a default (or identity) that the source lacks cannot be filled. Extra nullable target columns
+    are fine (left NULL).
+    """
+    target_names = {str(c["name"]) for c in target_columns}
+    source_names = [str(c.name) for c in table.columns]
+    missing = [n for n in source_names if n not in target_names]
+    required = [
+        str(c["name"])
+        for c in target_columns
+        if str(c["name"]) not in source_names
+        and not c.get("nullable", True)
+        and c.get("default") is None
+        and not c.get("identity")
+        and c.get("autoincrement") is not True
+        and not c.get("computed")
+    ]
+    if not missing and not required:
+        return None
+    parts = []
+    if missing:
+        parts.append(f"target table {table.name} lacks source column(s) {', '.join(missing)}")
+    if required:
+        parts.append(
+            f"target NOT NULL column(s) without default not in the source: {', '.join(required)}"
+        )
+    return f"schema drift: {'; '.join(parts)} (re-run with --mode full)"
+
+
 # -- writer ------------------------------------------------------------------------------------
 
 
 class SqlAlchemyWriter:
-    """Create tables and bulk-insert rows into a SQLAlchemy target. Use as a context manager."""
+    """Create tables and bulk-insert rows into a SQLAlchemy target. Use as a context manager.
 
-    def __init__(self, url: str, *, echo: bool = False) -> None:
+    ``schema``: create/read every table in that (existing) database schema; not for SQLite.
+    ``_force_generic_sync``: use the portable SELECT/UPDATE/INSERT sync even where a native upsert
+    (``INSERT ... ON CONFLICT``) exists (SQLite, PostgreSQL). Also settable as a class attribute.
+    """
+
+    _force_generic_sync: bool = False
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        echo: bool = False,
+        schema: str | None = None,
+        _force_generic_sync: bool | None = None,
+    ) -> None:
+        check_schema_name(schema)
         self._engine = _create_engine(url, echo)
         self.dialect: str = self._engine.dialect.name
+        if schema is not None and self.dialect == "sqlite":
+            self._engine.dispose()
+            raise UsageError("--schema is not supported for SQLite targets")
+        if _force_generic_sync is not None:
+            self._force_generic_sync = _force_generic_sync
+        self.schema = schema
         self.url: URL = self._engine.url
         self.url_masked: str = mask_url(self._engine.url)
-        self._metadata = MetaData()
+        self._metadata = MetaData(schema=schema)
         self._tables: dict[str, Table] = {}
         self._used_index_names: set[str] = set()
-        log.debug("opened target", extra={"kv": {"url": self.url_masked}})
+        log.debug("opened target", extra={"kv": {"url": self.url_masked, "schema": schema}})
 
     # lifecycle
 
@@ -204,12 +387,12 @@ class SqlAlchemyWriter:
             self._metadata.remove(old)
 
     def _seed_index_names(self, conn: Connection, converting: set[str]) -> None:
-        """Reserve index names of target tables that are not being converted."""
+        """Reserve index names of target tables (except those in ``converting``)."""
         insp = inspect(conn)
-        for existing in insp.get_table_names():
+        for existing in insp.get_table_names(schema=self.schema):
             if existing.casefold() in converting:
                 continue
-            for idx in insp.get_indexes(existing):
+            for idx in insp.get_indexes(existing, schema=self.schema):
                 if idx.get("name"):
                     self._used_index_names.add(idx["name"])
 
@@ -221,29 +404,52 @@ class SqlAlchemyWriter:
         self._tables[info.name] = table
         return table
 
+    def _get(self, info: TableInfo) -> Table:
+        table = self._tables.get(info.name)
+        return table if table is not None else self._build(info)
+
     def redact(self, text: str) -> str:
         """``text`` with this target's secrets removed (for messages and logs)."""
         return redact(text, self._engine.url)
 
-    def prepare(self, tables: Sequence[TableInfo], mode: Literal["full"] = "full") -> None:
+    def connect_error(self, exc: BaseException) -> TargetError:
+        """``TargetError`` for a failed connection, with a driver hint where it applies."""
+        cause = getattr(exc, "orig", None) or exc
+        text = self.redact(str(cause))
+        message = f"Cannot connect to target {self.url_masked}: {text}"
+        if self.dialect == "mssql" and _ODBC_DRIVER_MISSING.search(text):
+            message += f". {MSSQL_HINT}"
+        return TargetError(message)
+
+    def prepare(self, tables: Sequence[TableInfo], mode: Mode = "full") -> None:
         """Build the SQLAlchemy tables and reserve their index names. Executes no DDL.
 
-        Connects once to reserve the names of existing indexes on target tables that are not being
-        converted (``TargetError`` if the target is unreachable). Then call :meth:`create_table`
+        Connects once to reserve the names of existing target indexes (``TargetError`` if the
+        target is unreachable): in ``full`` mode those of tables not being converted (the others
+        are dropped and re-created), in ``append``/``sync`` mode all of them (nothing is
+        dropped). Then call :meth:`create_table` (full) or :meth:`ensure_table` (append/sync)
         for each table right before loading it.
         """
-        if mode != "full":
-            raise ValueError(f"unsupported mode {mode!r} (M3 supports only 'full')")
+        if mode not in MODES:
+            raise ValueError(f"unsupported mode {mode!r}; expected one of {MODES}")
+        converting = {t.name.casefold() for t in tables} if mode == "full" else set()
         try:
             with self._engine.connect() as conn:
-                self._seed_index_names(conn, {t.name.casefold() for t in tables})
-        except sa_exc.SQLAlchemyError as exc:
-            cause = getattr(exc, "orig", None) or exc
-            raise TargetError(
-                f"Cannot connect to target {self.url_masked}: {self.redact(str(cause))}"
-            ) from None
+                self._seed_index_names(conn, converting)
+        except (sa_exc.SQLAlchemyError, TypeError) as exc:
+            # TypeError: a DBAPI rejecting a connect argument (e.g. an unknown keyword)
+            raise self.connect_error(exc) from None
         for info in tables:
             self._build(info)
+
+    def table_warnings(self, info: TableInfo) -> list[str]:
+        """Warnings found while building the table (e.g. SQL Server indexes that were skipped)."""
+        return list(self._get(info).info.get("warnings", ()))
+
+    def _check_creatable(self, info: TableInfo, table: Table) -> None:
+        error = table.info.get("error")
+        if error:
+            raise WriteError(info.name, SchemaError(error), url=self._engine.url)
 
     def create_table(self, info: TableInfo) -> None:
         """``full`` DDL for one table: drop it if it exists, then create it and its indexes.
@@ -251,9 +457,8 @@ class SqlAlchemyWriter:
         Raises ``WriteError`` (message redacted) on failure; other target tables are untouched.
         A table not passed to :meth:`prepare` is built (and its index names reserved) here.
         """
-        table = self._tables.get(info.name)
-        if table is None:
-            table = self._build(info)
+        table = self._get(info)
+        self._check_creatable(info, table)
         try:
             with self._engine.begin() as conn:
                 table.drop(conn, checkfirst=True)
@@ -265,6 +470,29 @@ class SqlAlchemyWriter:
             extra={"kv": {"table": info.name, "indexes": len(table.indexes)}},
         )
 
+    def ensure_table(self, info: TableInfo) -> bool:
+        """``append``/``sync`` DDL: create the table if missing, else check it for schema drift.
+
+        Returns True when the table was created. Never drops anything. Raises ``WriteError``
+        (``schema drift: ...``) when the existing table cannot receive the source columns.
+        """
+        table = self._get(info)
+        try:
+            with self._engine.begin() as conn:
+                insp = inspect(conn)
+                if not insp.has_table(table.name, schema=self.schema):
+                    self._check_creatable(info, table)
+                    table.create(conn)
+                    log.debug("created missing table", extra={"kv": {"table": info.name}})
+                    return True
+                target_columns = insp.get_columns(table.name, schema=self.schema)
+        except sa_exc.SQLAlchemyError as exc:
+            raise WriteError(info.name, exc, url=self._engine.url) from exc
+        drift = schema_drift(table, target_columns)
+        if drift:
+            raise WriteError(info.name, SchemaError(drift), url=self._engine.url)
+        return False
+
     def _table(self, name: str) -> Table:
         table = self._tables.get(name)
         if table is not None:
@@ -273,31 +501,55 @@ class SqlAlchemyWriter:
             if key.casefold() == name.casefold():
                 return t
         insp = inspect(self._engine)
-        if not insp.has_table(name):
+        if not insp.has_table(name, schema=self.schema):
             raise TableNotFoundError(f"Table {name!r} not found in target {self.url_masked}")
-        return Table(quoted_name(name, quote=True), MetaData(), autoload_with=self._engine)
+        return Table(
+            quoted_name(name, quote=True),
+            MetaData(schema=self.schema),
+            autoload_with=self._engine,
+        )
 
     # data
 
     def write_batches(self, info: TableInfo, batches: Iterable[list[tuple]]) -> int:
         """Insert all batches in one transaction; on error roll back and raise ``WriteError``."""
-        table = self._tables.get(info.name)
-        if table is None:
-            table = self._build(info)
-        total = 0
+        table = self._get(info)
         try:
             with self._engine.begin() as conn:
-                insert, close = _inserter(conn, table)
-                try:
-                    for batch in batches:
-                        if batch:
-                            insert(batch)
-                            total += len(batch)
-                finally:
-                    close()
+                return _load(conn, table, batches, row_guard(table, self.dialect))
         except Exception as exc:  # roll-back already happened in engine.begin()
             raise WriteError(info.name, exc, url=self._engine.url) from exc
-        return total
+
+    def replace_rows(self, info: TableInfo, batches: Iterable[list[tuple]]) -> tuple[int, int]:
+        """Delete every target row, then insert all batches; one transaction.
+
+        Returns ``(deleted, inserted)``. Used by ``sync`` with ``--no-key replace``.
+        """
+        table = self._get(info)
+        try:
+            with self._engine.begin() as conn:
+                deleted = conn.execute(table.delete()).rowcount
+                inserted = _load(conn, table, batches, row_guard(table, self.dialect))
+        except Exception as exc:
+            raise WriteError(info.name, exc, url=self._engine.url) from exc
+        return max(deleted or 0, 0), inserted
+
+    def sync(self, info: TableInfo, key: Sequence[str]) -> SyncSession:
+        """A :class:`SyncSession` upserting ``info``'s rows by ``key`` (a context manager)."""
+        from acade2sql.writers.sync import SyncSession
+
+        table = self._get(info)
+        native = not self._force_generic_sync and self.dialect in NATIVE_UPSERT_DIALECTS
+        return SyncSession(
+            self._engine,
+            table,
+            tuple(key),
+            native=native,
+            guard=row_guard(table, self.dialect),
+            table_label=info.name,
+            url=self._engine.url,
+            column_types=info.column_types,
+        )
 
     def count_rows(self, name: str) -> int:
         table = self._table(name)
@@ -313,27 +565,51 @@ class SqlAlchemyWriter:
         if table.primary_key.columns:
             stmt = stmt.order_by(*table.primary_key.columns)
         with self._engine.connect() as conn:
-            result = conn.execution_options(stream_results=True).execute(stmt)
-            while True:
-                rows = result.fetchmany(batch_size)
-                if not rows:
-                    break
-                yield [tuple(r) for r in rows]
+            yield from fetch_batches(conn, stmt, batch_size)
+
+
+NATIVE_UPSERT_DIALECTS = frozenset({"sqlite", "postgresql"})
+
+
+def fetch_batches(conn: Connection, stmt: Any, batch_size: int) -> Iterator[list[tuple]]:
+    """Stream ``stmt``'s rows on ``conn`` as lists of tuples (``fetchmany``)."""
+    result = conn.execution_options(stream_results=True).execute(stmt)
+    while True:
+        rows = result.fetchmany(batch_size)
+        if not rows:
+            break
+        yield [tuple(r) for r in rows]
+
+
+def _load(conn: Connection, table: Table, batches: Iterable[list[tuple]], guard: RowGuard) -> int:
+    """Insert ``batches`` on ``conn`` (inside the caller's transaction); returns the row count."""
+    total = 0
+    insert, close = inserter(conn, table)
+    try:
+        for batch in batches:
+            if batch:
+                guard(batch)
+                insert(batch)
+                total += len(batch)
+    finally:
+        close()
+    return total
 
 
 def _noop() -> None:
     return None
 
 
-def _inserter(
+def inserter(
     conn: Connection, table: Table
 ) -> tuple[Callable[[list[tuple]], None], Callable[[], None]]:
-    """Return a function inserting one batch of positional tuples into ``table``.
+    """Return ``(insert, close)``: ``insert`` adds one batch of positional tuples to ``table``.
 
     SQLite fast path: the INSERT is compiled once by SQLAlchemy (dialect quoting, bound
     parameters) and the tuples go straight to the DBAPI cursor's ``executemany``, after applying
     each column's SQLAlchemy bind processor. Every other dialect (and any non-positional
-    compilation) uses ``conn.execute(table.insert(), list_of_dicts)``.
+    compilation) uses ``conn.execute(table.insert(), list_of_dicts)`` (on mssql+pyodbc with
+    ``fast_executemany``).
     """
     dialect = conn.dialect
     keys = [c.key for c in table.columns]

@@ -100,13 +100,24 @@ def test_bytes():
     assert cs((b"\x00",)) != cs((None,))
 
 
+def csg(*rows):
+    """Checksum with a single GUID column (folding is column-aware since review gate 2)."""
+    return table_checksum([list(rows)], column_types=["GUID"])
+
+
 def test_guid_normalised():
     g = "12345678-1234-1234-1234-123456789abc"
-    assert cs((g,)) == cs((g.upper(),))
-    assert cs(("{" + g.upper() + "}",)) == cs((g,))
-    assert cs(("{" + g + "}",)) == cs((g.upper(),))
+    assert csg((g,)) == csg((g.upper(),))
+    assert csg(("{" + g.upper() + "}",)) == csg((g,))
+    assert csg(("{" + g + "}",)) == csg((g.upper(),))
     other = "12345678-1234-1234-1234-123456789abd"
-    assert cs((g,)) != cs((other,))
+    assert csg((g,)) != csg((other,))
+
+
+def test_guid_shaped_text_is_exact_without_column_types():
+    g = "12345678-1234-1234-1234-123456789abc"
+    assert cs((g,)) != cs((g.upper(),))
+    assert cs(("{" + g + "}",)) != cs((g,))
 
 
 def test_non_guid_strings_case_sensitive():
