@@ -6,13 +6,95 @@ All notable changes to acade2sql are documented here. The format follows
 
 ## [Unreleased]
 
-Milestone M5 is planned. Nothing below is released yet.
+Nothing yet. Still open from the plan: verification of the SQL Server and PostgreSQL targets
+against live servers, and a test with a real ACADE project database.
 
-### Planned
-- Pure-Python fallback reader (`access-parser`) for machines without the Microsoft Access ODBC
-  driver.
-- CLI polish.
-- Verification of the SQL Server and PostgreSQL targets against live servers.
+## [0.3.0] - 2026-10-19
+
+Milestone M5: a reader that needs no Access driver, reader selection, `doctor`, CLI polish and the
+0.2.0 backlog. See [M5_SPEC.md](M5_SPEC.md) and [DECISIONS.md](DECISIONS.md) #37 to #44.
+
+### Added
+- **Pure-Python Access reader** (`--reader pure`). It reads `.mdb` and `.accdb` files without the
+  Microsoft Access ODBC driver and without pyodbc. It returns the same tables, column types,
+  indexes, primary keys and values as the ODBC reader.
+  - It decodes Jet 4 compressed Unicode text itself. access-parser's own text decoder corrupts it
+    (for example U+2013 `–` read as `'\x13'`) and silently drops undecodable bytes. Text that cannot
+    be decoded makes the table `error`; it is never replaced or dropped.
+  - It opens the file read-only (memory-mapped) and never creates a `.ldb` / `.laccdb` lock file.
+  - It never returns a partial table. If the pages it finds for a table do not add up to the row
+    count stored in the table definition, or a page listed for the table belongs to another one, it
+    raises `SourceIntegrityError` and the table becomes `error` (a sync of that table is rolled back).
+  - It refuses, with a clear error and never wrong data: password-protected databases, encrypted
+    (RC4-encoded or ACCDB-encrypted) databases, and per table, attachment / multi-value fields,
+    calculated fields and Date/Time Extended fields.
+  - If a lock file (`.ldb` / `.laccdb`) next to the source shows that the database is open in
+    another program, it logs a warning recommending to close AutoCAD Electrical / Access or to use
+    `--copy-to-temp`.
+- `--reader {auto,odbc,pure}` on `inspect` and `convert` (default `auto`), and `reader=` in the
+  Python API (`convert()`, `open_reader()`). `auto` uses the ODBC reader when the driver is usable,
+  otherwise the pure reader with one warning.
+- `"reader": "odbc" | "pure"` in the JSON report and in `inspect --json`.
+- `acade2sql doctor`: Python version and bitness, the Access ODBC drivers (also a driver of the
+  other bitness), which readers are usable, psycopg and pyodbc versions, SQL Server ODBC drivers,
+  and the acade2sql version. Exit 0 when at least one Access reader is usable, else 1.
+- `python -m acade2sql` runs the CLI.
+- `--progress` / `--no-progress` for `convert`: one line per finished table on stderr
+  (`[5/19] BIG 12345 rows 0.2s`). On by default when stderr is a terminal.
+- `--tables-file PATH` / `--exclude-file PATH`: table names from a UTF-8 file, one exact name per
+  line (commas are part of the name), blank lines and `#` comments ignored. They add to `--tables`
+  / `--exclude`. This is the way to select a table whose name contains a comma.
+- `scripts/compare_readers.py`: compares the pure and ODBC readers table by table (schema and
+  checksum of all rows). Exit 0 identical, 1 differences, 2 usage error.
+- A per-table warning for dates before 1753-01-01: `dates before 1753 are read using the ODBC
+  driver's calendar and may differ from what Access displays`. The status is not affected.
+- `UsageError`, `SchemaError`, `SyncKeyError` and `TargetDataError` can be imported from
+  `acade2sql`.
+
+### Changed
+- `access-parser>=0.0.6,<0.1` (Apache-2.0) and `construct` are now core dependencies. The
+  `fallback` extra still exists but installs nothing.
+- When the Access driver (or pyodbc) is missing, `inspect` and `convert` no longer stop with exit 1:
+  the default `--reader auto` falls back to the pure reader with a warning. `--reader odbc` keeps
+  the 0.2.0 behaviour (exit 1 with the installer to use).
+- `--help` lists `doctor`.
+
+### Fixed
+- Short passwords are masked in all structured positions (URL user info, `PWD=`, `password=` and
+  other secret query values) no matter how short. Free-text occurrences are masked when the secret
+  has 4 or more characters, so a 2-character password no longer masks unrelated text.
+- A `PWD=` / `password=` query value right after `?` or `&` is masked only up to the next `&`
+  (`?password=***&sslmode=require`), so following parameters stay readable.
+- `--dry-run --mode sync` of a table without a key (`--no-key error`) no longer lists the
+  `replace-rows` action or prints DDL for that table. If no statement remains, the DDL section
+  reads `-- DDL: none (no table would be created)`.
+- `--checksum` together with `--dry-run` now prints `warning: --checksum is ignored with --dry-run`
+  (the exit code is unchanged).
+
+### Verified
+- `scripts/compare_readers.py` on both sample databases: `footprint_lookup.accdb` 117/117 tables
+  identical (ODBC 3.4 s, pure 3.7 s), `default_cat.mdb` 168/168 identical (ODBC 128.7 s, pure
+  81.6 s, both including checksums). This includes the 260 rows of table `MS` that contain U+2013
+  `–`.
+- `acade2sql convert default_cat.mdb --reader pure --checksum`: 168/168 tables pass.
+- Synthetic `.mdb` and `.accdb` fixtures (19 tables, all Access types): pure and ODBC readers
+  identical; full conversion with `--reader pure --checksum` passes every table.
+
+### Known limitations
+- **The ODBC driver misreads Access "Large Number" (`BIGINT`) columns** (it reports them as
+  `CHAR(4)`). The ODBC reader detects this from the file's table definition and refuses the table,
+  with status `error` and a "use --reader pure" message, instead of writing garbage. Use
+  `--reader pure` for files with Large Number columns. The ACADE sample databases have none.
+- Dates before 1753: both readers use the ODBC driver's calendar, which can differ from what Access
+  displays (for example `#1700-06-15#` reads as 1700-06-02). The table gets a warning.
+- Jet 3 (Access 97) files: supported by the pure reader, but not tested (no sample file).
+- The pure reader memory-maps the source file and streams rows page by page. It does not read one
+  table into memory as a whole, but it has only been measured on the two sample databases (up to
+  about 645 MB).
+- SQL Server and PostgreSQL still have not been tested against a live server.
+- The writer does not support the legacy `SQL Server` ODBC driver or SQL Server Native Client;
+  `doctor` marks them "not supported by the writer". Use ODBC Driver 17 or 18 for SQL Server.
+- No real ACADE project database has been tested yet.
 
 ## [0.2.0] - 2026-10-19
 

@@ -1,4 +1,4 @@
-"""Command-line interface: ``acade2sql inspect`` and ``acade2sql convert``."""
+"""Command-line interface: ``acade2sql inspect``, ``convert`` and ``doctor``."""
 
 from __future__ import annotations
 
@@ -15,9 +15,10 @@ from acade2sql.converter import TARGET_ENV, convert
 from acade2sql.errors import Acade2SqlError, UsageError
 from acade2sql.keys import NO_KEY_CHOICES
 from acade2sql.logging_setup import configure_logging
-from acade2sql.readers import Reader, open_reader
+from acade2sql.readers import READER_CHOICES, Reader, open_reader
 from acade2sql.redact import redact
 from acade2sql.schema import TableInfo
+from acade2sql.validate import TableResult
 from acade2sql.writers.sqlalchemy_writer import MODES
 
 log = logging.getLogger("acade2sql.cli")
@@ -48,8 +49,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
+    source = argparse.ArgumentParser(add_help=False)
+    source.add_argument(
+        "--reader",
+        choices=list(READER_CHOICES),
+        default="auto",
+        help="Access reader: odbc (Microsoft Access ODBC driver), pure (pure Python, no driver "
+        "needed) or auto: odbc when the driver is usable, else pure (default: auto)",
+    )
 
-    insp = sub.add_parser("inspect", parents=[common], help="list tables, columns, keys, counts")
+    insp = sub.add_parser(
+        "inspect", parents=[common, source], help="list tables, columns, keys, counts"
+    )
     insp.add_argument("path", help="Access database (.mdb or .accdb)")
     insp.add_argument(
         "--table",
@@ -66,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="count rows per table (default: on)",
     )
 
-    conv = sub.add_parser("convert", parents=[common], help="convert to a SQL database")
+    conv = sub.add_parser("convert", parents=[common, source], help="convert to a SQL database")
     conv.add_argument("source", help="Access database (.mdb or .accdb)")
     conv.add_argument(
         "--target",
@@ -96,6 +107,23 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_name_list,
         metavar="T",
         help="skip these tables (space/comma-separated, repeatable)",
+    )
+    conv.add_argument(
+        "--tables-file",
+        metavar="PATH",
+        help="only the tables named in this UTF-8 file: one exact name per line (commas are part "
+        "of the name), blank lines and # comments ignored; combines with --tables",
+    )
+    conv.add_argument(
+        "--exclude-file",
+        metavar="PATH",
+        help="skip the tables named in this file (same format); combines with --exclude",
+    )
+    conv.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="one line per finished table on stderr (default: on when stderr is a terminal)",
     )
     conv.add_argument(
         "--batch-size",
@@ -141,6 +169,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="--dry-run: do not count source rows",
     )
+
+    sub.add_parser(
+        "doctor",
+        parents=[common],
+        help="check Python, the Access readers and the target drivers on this machine",
+    )
     return parser
 
 
@@ -153,6 +187,46 @@ def _name_list(text: str) -> list[str]:
 
 def _flatten(groups: list[list[str]] | None) -> list[str] | None:
     return None if groups is None else [n for group in groups for n in group]
+
+
+def _read_names_file(path: str, option: str) -> list[str]:
+    """Table names from a UTF-8 file: one per line (no comma splitting), stripped; blank lines
+    and lines starting with ``#`` are ignored."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        raise UsageError(f"cannot read {option} {path}: {exc.strerror or exc}") from None
+    except UnicodeDecodeError as exc:
+        raise UsageError(f"{option} {path} is not UTF-8: {exc}") from None
+    return [s for s in (line.strip() for line in lines) if s and not s.startswith("#")]
+
+
+def _names(groups: list[list[str]] | None, path: str | None, option: str) -> list[str] | None:
+    """``--tables``/``--exclude`` values plus the names of the matching ``-file`` option."""
+    names = _flatten(groups)
+    if path is None:
+        return names
+    from_file = _read_names_file(path, option)
+    if not from_file and not names and option == "--tables-file":
+        raise UsageError(f"{option} {path} lists no table names")
+    return (names or []) + from_file
+
+
+def _progress_printer(enabled: bool | None):
+    """The ``progress`` callback for :func:`convert`, or None (stderr only, never stdout)."""
+    if enabled is None:
+        isatty = getattr(sys.stderr, "isatty", None)
+        enabled = bool(isatty and isatty())
+    if not enabled:
+        return None
+
+    def report(res: TableResult, index: int, total: int) -> None:
+        rows = res.source_rows if res.source_rows is not None else (res.target_rows or 0)
+        sys.stderr.write(f"[{index}/{total}] {res.name} {rows} rows {res.seconds:.1f}s\n")
+        sys.stderr.flush()
+
+    return report
 
 
 def _positive_int(text: str) -> int:
@@ -219,11 +293,12 @@ def _print_detail(t: dict[str, Any], out: TextIO) -> None:
 
 
 def _cmd_inspect(args: argparse.Namespace, out: TextIO) -> int:
-    with open_reader(args.path) as reader:
+    with open_reader(args.path, reader=args.reader) as reader:
         names = args.tables or reader.list_tables()
         tables = _collect(reader, names, args.counts)
     if args.json:
-        json.dump({"source": str(reader.path), "tables": tables}, out, indent=2)
+        doc = {"source": str(reader.path), "reader": reader.kind, "tables": tables}
+        json.dump(doc, out, indent=2)
         out.write("\n")
         return EXIT_OK
     _print_summary(tables, out)
@@ -237,12 +312,16 @@ def _cmd_convert(args: argparse.Namespace, out: TextIO) -> int:
     started = time.perf_counter()
     if args.no_key is not None and args.mode != "sync":
         raise UsageError("--no-key requires --mode sync")
+    tables = _names(args.tables, args.tables_file, "--tables-file")
+    exclude = _names(args.exclude, args.exclude_file, "--exclude-file")
+    if args.checksum and args.dry_run:
+        sys.stderr.write("warning: --checksum is ignored with --dry-run\n")
     report = convert(
         args.source,
         args.target,
         mode=args.mode,
-        tables=_flatten(args.tables),
-        exclude=_flatten(args.exclude),
+        tables=tables,
+        exclude=exclude,
         batch_size=args.batch_size,
         checksum=args.checksum,
         copy_to_temp=args.copy_to_temp,
@@ -253,6 +332,8 @@ def _cmd_convert(args: argparse.Namespace, out: TextIO) -> int:
         schema=args.schema,
         dry_run=args.dry_run,
         counts=args.counts,
+        reader=args.reader,
+        progress=_progress_printer(args.progress),
     )
     elapsed = time.perf_counter() - started
     if not report.tables:
@@ -281,6 +362,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "inspect":
             return _cmd_inspect(args, sys.stdout)
+        if args.command == "doctor":
+            from acade2sql import doctor
+
+            return doctor.run(sys.stdout)
         return _cmd_convert(args, sys.stdout)
     except UsageError as exc:
         sys.stderr.write(f"error: {redact(str(exc), getattr(args, 'target', None))}\n")

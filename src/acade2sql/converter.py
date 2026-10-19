@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from sqlalchemy.engine import URL, make_url
@@ -23,7 +23,7 @@ from acade2sql.modes import (
     error_text,
     unmapped_type_warnings,
 )
-from acade2sql.readers import Reader, open_reader
+from acade2sql.readers import READER_CHOICES, Reader, ReaderChoice, open_reader
 from acade2sql.redact import mask_url
 from acade2sql.schema import TableInfo
 from acade2sql.validate import Report, TableResult, utc_now
@@ -34,6 +34,8 @@ from acade2sql.writers.sqlalchemy_writer import MODES, check_schema_name
 log = logging.getLogger(__name__)
 
 TARGET_ENV = "ACADE2SQL_TARGET"
+#: ``progress(result, index, total)``: called after each table of a real run (1-based index).
+Progress = Callable[[TableResult, int, int], None]
 SQLITE_SUFFIXES = frozenset({".sqlite", ".db", ".sqlite3"})
 
 
@@ -189,6 +191,8 @@ def convert(
     schema: str | None = None,
     dry_run: bool = False,
     counts: bool = True,
+    reader: ReaderChoice = "auto",
+    progress: Progress | None = None,
 ) -> Report:
     """Convert ``source`` to ``target`` (see :func:`resolve_target`) and return the report.
 
@@ -197,7 +201,9 @@ def convert(
     in the source; ``no_key`` decides what happens to tables without a key). ``key``: specs
     ``"COL[,COL...]"`` (all tables having those columns) and ``"TABLE=COL[,COL...]"``.
     ``schema``: target schema (not SQLite). ``dry_run``: plan + DDL, no target connection
-    (``counts=False`` skips the source row counts).
+    (``counts=False`` skips the source row counts). ``reader``: ``auto`` (ODBC driver if usable,
+    else the pure-Python reader with a warning), ``odbc`` or ``pure``; the report records the one
+    used. ``progress``: called with ``(result, index, total)`` after each table of a real run.
 
     Invalid option combinations raise :class:`UsageError` (a ``ValueError``) before anything
     is opened. Acade2SqlError subclasses raised before the target is modified (bad source,
@@ -206,6 +212,8 @@ def convert(
     continues. The report is written to ``report_path`` whenever the run gets that far.
     """
     keys = _check_options(mode, batch_size, key, no_key, delete_missing, dry_run, counts)
+    if reader not in READER_CHOICES:
+        raise UsageError(f"reader must be one of {', '.join(READER_CHOICES)}, got {reader!r}")
     check_schema_name(schema)
     source_path = Path(source)
     url = resolve_target(target, source_path)
@@ -214,22 +222,23 @@ def convert(
     opts = RunOptions(mode, batch_size, checksum, keys, no_key, delete_missing)
     started = utc_now()
     ddl: list[str] = []
-    with open_reader(source_path, copy_to_temp=copy_to_temp) as reader:
-        names = select_tables(reader.list_tables(), tables, exclude)
+    with open_reader(source_path, copy_to_temp=copy_to_temp, reader=reader) as source_reader:
+        reader_kind = getattr(source_reader, "kind", None)
+        names = select_tables(source_reader.list_tables(), tables, exclude)
         if not names:
             # INFO, not WARNING: the CLI prints "warning: no tables selected" itself (once).
-            log.info("no tables selected", extra={"kv": {"source": str(reader.path)}})
+            log.info("no tables selected", extra={"kv": {"source": str(source_reader.path)}})
         for unknown in unmatched_tables(keys, names):
             log.warning("--key table not converted", extra={"kv": {"table": unknown}})
         results: list[TableResult] = []
-        infos = _read_schemas(reader, names, results)
+        infos = _read_schemas(source_reader, names, results)
         if dry_run:
             planned, ddl, masked = plan.dry_run(
-                reader, infos, url, opts, schema=schema, counts=counts
+                source_reader, infos, url, opts, schema=schema, counts=counts
             )
             results.extend(planned)
         else:
-            results.extend(_write_all(reader, infos, url, opts, schema))
+            results.extend(_write_all(source_reader, infos, url, opts, schema, progress))
             masked = mask_url(url)
     order = {n: i for i, n in enumerate(names)}
     results.sort(key=lambda r: order.get(r.name, len(order)))
@@ -243,6 +252,7 @@ def convert(
         dry_run=dry_run,
         schema=schema,
         ddl=ddl,
+        reader=reader_kind,
     )
     if report_path is not None:
         report.write_json(report_path)
@@ -250,7 +260,12 @@ def convert(
 
 
 def _write_all(
-    reader: Reader, infos: Sequence[TableInfo], url: str, opts: RunOptions, schema: str | None
+    reader: Reader,
+    infos: Sequence[TableInfo],
+    url: str,
+    opts: RunOptions,
+    schema: str | None,
+    progress: Progress | None = None,
 ) -> list[TableResult]:
     with SqlAlchemyWriter(url, schema=schema) as writer:
         log.info(
@@ -268,4 +283,10 @@ def _write_all(
             check_pg_identifiers(infos, schema)  # before any target modification
         if infos:
             writer.prepare(infos, mode=opts.mode)  # no DDL; TargetError if unreachable
-        return [_convert_table(reader, writer, info, opts) for info in infos]
+        results = []
+        for index, info in enumerate(infos, 1):
+            res = _convert_table(reader, writer, info, opts)
+            results.append(res)
+            if progress is not None:
+                progress(res, index, len(infos))
+        return results

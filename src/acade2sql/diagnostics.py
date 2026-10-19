@@ -7,8 +7,7 @@ import re
 import struct
 import sys
 from dataclasses import dataclass, field
-
-import pyodbc
+from typing import TYPE_CHECKING
 
 from acade2sql.errors import (
     Acade2SqlError,
@@ -16,6 +15,9 @@ from acade2sql.errors import (
     DriverNotFoundError,
     SourceNotFoundError,
 )
+
+if TYPE_CHECKING:
+    import pyodbc
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +106,15 @@ def _other_bitness_has_driver() -> bool:
         return False
 
 
+def pyodbc_unavailable_message(exc: BaseException) -> str:
+    """Why the ODBC reader cannot be used when ``import pyodbc`` fails (no pyodbc needed)."""
+    return (
+        f"pyodbc not importable ({type(exc).__name__}: {exc}); the ODBC reader cannot be used. "
+        "Install pyodbc ('python -m pip install pyodbc'; on Linux/macOS it also needs unixODBC) "
+        "or use --reader pure."
+    )
+
+
 def _is_access_driver(name: str) -> bool:
     lowered = name.lower()
     return "access driver" in lowered or "*.mdb" in lowered
@@ -117,7 +128,14 @@ def diagnose_driver(drivers: list[str] | None = None) -> DriverStatus:
     """
     bits = python_bits()
     probe_registry = drivers is None
-    installed = list(pyodbc.drivers()) if drivers is None else list(drivers)
+    if drivers is None:
+        try:
+            import pyodbc  # lazy: this module must import where pyodbc cannot
+        except (ImportError, OSError) as exc:
+            return DriverStatus(False, bits, [], pyodbc_unavailable_message(exc))
+        installed = list(pyodbc.drivers())
+    else:
+        installed = list(drivers)
     access = [d for d in installed if _is_access_driver(d)]
     usable = [d for d in ACCESS_DRIVER_NAMES if d in installed]
     if usable:

@@ -6,6 +6,7 @@ Each ``run_*`` function fills a :class:`TableResult` in place and raises on fail
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from acade2sql.keys import NO_KEY_MESSAGE, KeySpec, key_for
 from acade2sql.readers import Reader
 from acade2sql.redact import redact
 from acade2sql.schema import TableInfo
-from acade2sql.typemap import is_known
+from acade2sql.typemap import canonical_type, is_known
 from acade2sql.validate import Status, TableResult, table_checksum
 from acade2sql.writers import SqlAlchemyWriter
 from acade2sql.writers.sqlalchemy_writer import Mode
@@ -27,6 +28,11 @@ log = logging.getLogger(__name__)
 
 NoKey = Literal["error", "replace"]
 APPEND_CHECKSUM_WARNING = "checksum not computed in append mode"
+PRE_1753_WARNING = (
+    "dates before 1753 are read using the ODBC driver's calendar and may differ from what "
+    "Access displays"
+)
+_DRIVER_CALENDAR_START = dt.datetime(1753, 1, 1)
 
 _T = TypeVar("_T")
 
@@ -77,15 +83,57 @@ def read(fn: Callable[[], _T]) -> _T:
         raise ReadFailed(exc) from exc
 
 
-def load(write: Callable[[SourceBatches], _T], reader: Reader, info: TableInfo, size: int) -> _T:
-    """Run ``write`` over the source batches; a source failure is reported as ``read failed``."""
-    source = SourceBatches(lambda: reader.iter_rows(info.name, size))
+class EarlyDates:
+    """Notices DATETIME values before 1753-01-01 in the rows passing through :meth:`watch`.
+
+    Both readers return such dates in the Access ODBC driver's calendar, which drifts from the
+    proleptic Gregorian dates Access displays (DECISIONS #39); the table gets a warning."""
+
+    def __init__(self, info: TableInfo) -> None:
+        self.columns = [
+            i for i, t in enumerate(info.column_types) if canonical_type(t) == "DATETIME"
+        ]
+        self.found = False
+
+    def _scan(self, batch: list[tuple]) -> bool:
+        start = _DRIVER_CALENDAR_START
+        for row in batch:
+            for i in self.columns:
+                value = row[i]
+                if isinstance(value, dt.datetime) and value < start:
+                    return True
+        return False
+
+    def watch(self, batches: Iterable[list[tuple]]) -> Iterator[list[tuple]]:
+        for batch in batches:
+            if self.columns and not self.found:
+                self.found = self._scan(batch)
+            yield batch
+
+    def report(self, res: TableResult | None) -> None:
+        if self.found and res is not None and PRE_1753_WARNING not in res.warnings:
+            res.warnings.append(PRE_1753_WARNING)
+
+
+def load(
+    write: Callable[[SourceBatches], _T],
+    reader: Reader,
+    info: TableInfo,
+    size: int,
+    res: TableResult | None = None,
+) -> _T:
+    """Run ``write`` over the source batches; a source failure is reported as ``read failed``.
+    ``res``: receives the pre-1753 date warning when such a date was read."""
+    dates = EarlyDates(info)
+    source = SourceBatches(lambda: dates.watch(reader.iter_rows(info.name, size)))
     try:
-        return write(source)
+        result = write(source)
     except Exception as exc:
         if source.error is not None:
             raise ReadFailed(source.error) from exc
         raise
+    dates.report(res)
+    return result
 
 
 def error_text(exc: BaseException, url: URL | str | None) -> str:
@@ -130,7 +178,7 @@ def run_full(
     """Drop + create + load; pass when counts (and checksums, if requested) match."""
     res.source_rows = read(lambda: reader.count_rows(info.name))
     writer.create_table(info)
-    written = load(lambda b: writer.write_batches(info, b), reader, info, opts.batch_size)
+    written = load(lambda b: writer.write_batches(info, b), reader, info, opts.batch_size, res)
     res.target_rows = writer.count_rows(info.name)
     if opts.checksum:
         src = _source_checksum(reader, info, opts.batch_size)
@@ -148,7 +196,7 @@ def run_append(
     res.source_rows = read(lambda: reader.count_rows(info.name))
     created = writer.ensure_table(info)
     res.target_rows_before = 0 if created else writer.count_rows(info.name)
-    written = load(lambda b: writer.write_batches(info, b), reader, info, opts.batch_size)
+    written = load(lambda b: writer.write_batches(info, b), reader, info, opts.batch_size, res)
     res.inserted = written
     res.target_rows = writer.count_rows(info.name)
     if opts.checksum:
@@ -170,7 +218,9 @@ def run_sync(
     if key is None:
         return _replace(reader, writer, info, opts, res)
     with writer.sync(info, key) as session:
-        counts = load(lambda b: session.load(b, opts.delete_missing), reader, info, opts.batch_size)
+        counts = load(
+            lambda b: session.load(b, opts.delete_missing), reader, info, opts.batch_size, res
+        )
         in_source = session.count_matching()
         res.target_rows = session.count_all()
         if opts.checksum:
@@ -193,7 +243,9 @@ def run_sync(
 def _replace(
     reader: Reader, writer: SqlAlchemyWriter, info: TableInfo, opts: RunOptions, res: TableResult
 ) -> int:
-    deleted, inserted = load(lambda b: writer.replace_rows(info, b), reader, info, opts.batch_size)
+    deleted, inserted = load(
+        lambda b: writer.replace_rows(info, b), reader, info, opts.batch_size, res
+    )
     res.deleted, res.inserted, res.updated, res.unchanged = deleted, inserted, 0, 0
     res.target_rows = writer.count_rows(info.name)
     res.extra_rows = 0

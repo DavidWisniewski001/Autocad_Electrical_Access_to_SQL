@@ -76,6 +76,7 @@ class Report:
     dry_run: bool = False
     schema: str | None = None
     ddl: list[str] = field(default_factory=list)  # dry-run: the DDL that would be executed
+    reader: str | None = None  # M5: "odbc" | "pure", the backend that read the source
 
     @property
     def ok(self) -> bool:
@@ -93,6 +94,7 @@ class Report:
             "source": self.source,
             "target": self.target,
             "mode": self.mode,
+            "reader": self.reader,
             "started": self.started,
             "finished": self.finished,
             "ok": self.ok,
@@ -150,7 +152,7 @@ class Report:
             for t in self.tables:
                 for w in t.warnings:
                     lines.append(f"warning: {t.name}: {w}")
-            lines.append("-- DDL")
+            lines.append("-- DDL" if self.ddl else "-- DDL: none (no table would be created)")
             lines.extend(stmt.rstrip() + ";" for stmt in self.ddl)
         return "\n".join(lines)
 

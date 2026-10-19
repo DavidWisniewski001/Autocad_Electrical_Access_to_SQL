@@ -25,6 +25,19 @@ def _all_rows(reader, name, batch_size=5000):
     return list(itertools.chain.from_iterable(reader.iter_rows(name, batch_size=batch_size)))
 
 
+def expected_pk(reader_kind, info, name):
+    """Expected (primary_key, source) of ``info``.
+
+    ODBC reads the declared indexes: the manifest is exact. The pure reader reports whatever
+    indexes it reports (``info.indexes``); without any, the key falls through to the
+    inference rule (single COUNTER -> inferred, else none) -- see test_pure_reader.py.
+    """
+    if reader_kind == "odbc" or info.indexes:
+        return MANIFEST[name]["pk"], MANIFEST[name]["pk_source"]
+    counters = [c.name for c in info.columns if c.autoincrement]
+    return ((counters[0],), "inferred") if len(counters) == 1 else ((), "none")
+
+
 # ---------------------------------------------------------------- list_tables
 
 
@@ -60,6 +73,7 @@ def test_system_tables_not_resolvable(reader):
         "_PINLIST_BRUNDY/HUBBEL",
         "KRAUS & NAIMER",
         "DO",
+        "COMMA,NAME",
     ],
 )
 def test_hostile_table_names_present(reader, name):
@@ -77,7 +91,7 @@ def test_hostile_column_names(reader):
 
 
 def test_hostile_table_rows(reader):
-    for name in ("ALLEN-BRADLEY", "KRAUS & NAIMER", "DO", "_PINLIST_BRUNDY/HUBBEL"):
+    for name in ("ALLEN-BRADLEY", "KRAUS & NAIMER", "DO", "_PINLIST_BRUNDY/HUBBEL", "COMMA,NAME"):
         assert _all_rows(reader, name) == MANIFEST[name]["rows"], name
 
 
@@ -98,29 +112,36 @@ def test_columns_match_manifest(reader, name):
 
 
 @pytest.mark.parametrize("name", sorted(MANIFEST))
-def test_primary_key_matches_manifest(reader, name):
+def test_primary_key_matches_manifest(reader, reader_kind, name):
     info = reader.get_table(name)
-    assert info.primary_key == MANIFEST[name]["pk"]
-    assert info.primary_key_source == MANIFEST[name]["pk_source"]
+    pk, src = expected_pk(reader_kind, info, name)
+    assert (info.primary_key, info.primary_key_source) == (pk, src)
 
 
-def test_pk_discovered_declared_single(reader):
+def test_pk_discovered_declared_single(reader, reader_kind):
     info = reader.get_table("COMP")
+    if reader_kind == "pure" and not info.indexes:
+        assert (info.primary_key, info.primary_key_source) == ((), "none")
+        return
     assert (info.primary_key, info.primary_key_source) == (("HDL",), "discovered")
     pk_idx = [i for i in info.indexes if i.name == "PrimaryKey"]
     assert len(pk_idx) == 1 and pk_idx[0].unique and pk_idx[0].columns == ("HDL",)
 
 
-def test_pk_discovered_composite_non_counter_key_order(reader):
+def test_pk_discovered_composite_non_counter_key_order(reader, reader_kind):
     info = reader.get_table("TERMS")
+    if reader_kind == "pure" and not info.indexes:
+        assert (info.primary_key, info.primary_key_source) == ((), "none")
+        return
     assert info.primary_key == ("HDL", "TERM")
     assert info.primary_key_source == "discovered"
 
 
-def test_pk_discovered_on_counter_column(reader):
+def test_pk_discovered_on_counter_column(reader, reader_kind):
     info = reader.get_table("TYPED")
     assert info.primary_key == ("ID",)
-    assert info.primary_key_source == "discovered"
+    expected = "inferred" if reader_kind == "pure" and not info.indexes else "discovered"
+    assert info.primary_key_source == expected
 
 
 def test_pk_inferred_from_counter(reader):
@@ -139,9 +160,11 @@ def test_pk_none(reader):
     assert not any(c.autoincrement for c in info.columns)
 
 
-def test_index_non_unique_composite(reader):
+def test_index_non_unique_composite(reader, reader_kind):
     for name in ("XX", "_PINLIST_XX"):
         info = reader.get_table(name)
+        if reader_kind == "pure" and not info.indexes:
+            continue  # documented: the pure reader reports no indexes (test_pure_reader.py)
         idx = {i.name: i for i in info.indexes}
         assert "IDX_CAT" in idx, name
         assert idx["IDX_CAT"].columns == ("CATALOG", "ASSEMBLYCODE")
@@ -152,14 +175,18 @@ def test_no_indexes_when_none_declared(reader):
     assert reader.get_table("PNLCOMP").indexes == ()
 
 
-def test_varchar_size_and_nullability(reader):
+def test_varchar_size_and_nullability(reader, reader_kind):
     info = reader.get_table("COMP")
     hdl = info.column("HDL")
     # NOTE: the Access ODBC driver reports NOT NULL columns as nullable (SQLColumns), only
     # COUNTER is reported NOT NULL, so nullability of HDL is deliberately not asserted.
     assert hdl.access_type == "VARCHAR" and hdl.size == 20
     tag = info.column("TAGNAME")
-    assert tag.size == 60 and tag.nullable is True and tag.autoincrement is False
+    assert tag.size == 60 and tag.autoincrement is False
+    if reader_kind == "odbc":
+        assert tag.nullable is True
+    else:  # pure: see test_pure_reader.py::test_pure_nullable_documented
+        assert isinstance(tag.nullable, bool)
 
 
 def test_memo_type(reader):
@@ -265,6 +292,9 @@ def test_iter_rows_bad_batch_size(reader, bad):
         "NETS",
         "XX",
         "_PINLIST_XX",
+        "UNIRUNS",
+        "COMMA,NAME",
+        "DATES",
     ],
 )
 def test_manifest_rows_exact(reader, name):
@@ -384,27 +414,32 @@ def test_guid_value(reader):
 # -------------------------------------------------------------- source handling
 
 
-def test_missing_file(tmp_path):
+def test_missing_file(tmp_path, reader_kind):
     with pytest.raises(SourceNotFoundError):
-        open_reader(tmp_path / "nope.mdb")
+        open_reader(tmp_path / "nope.mdb", reader=reader_kind)
+    with pytest.raises(SourceNotFoundError):
+        open_reader(tmp_path / "nope.accdb", reader=reader_kind)
+
+
+def test_missing_file_pyodbc_class(tmp_path):
     with pytest.raises(SourceNotFoundError):
         PyodbcReader(tmp_path / "nope.accdb")
 
 
-def test_wrong_suffix(tmp_path):
+def test_wrong_suffix(tmp_path, reader_kind):
     p = tmp_path / "data.txt"
     p.write_text("x")
     with pytest.raises(SourceNotFoundError):
-        open_reader(p)
+        open_reader(p, reader=reader_kind)
 
 
-def test_directory_is_not_a_source(tmp_path):
+def test_directory_is_not_a_source(tmp_path, reader_kind):
     with pytest.raises(SourceNotFoundError):
-        open_reader(tmp_path)
+        open_reader(tmp_path, reader=reader_kind)
 
 
-def test_context_manager_and_idempotent_close(access_db):
-    r = open_reader(access_db)
+def test_context_manager_and_idempotent_close(access_db, reader_kind):
+    r = open_reader(access_db, reader=reader_kind)
     assert Path(r.path).name == access_db.name
     with r as same:
         assert same is r
@@ -413,14 +448,14 @@ def test_context_manager_and_idempotent_close(access_db):
     r.close()  # idempotent
 
 
-def test_explicit_close_idempotent(access_db):
-    r = open_reader(access_db)
+def test_explicit_close_idempotent(access_db, reader_kind):
+    r = open_reader(access_db, reader=reader_kind)
     r.close()
     r.close()
 
 
-def test_use_after_close_fails_cleanly(access_db):
-    r = open_reader(access_db)
+def test_use_after_close_fails_cleanly(access_db, reader_kind):
+    r = open_reader(access_db, reader=reader_kind)
     r.close()
     with pytest.raises(Exception) as ei:
         r.count_rows("COMP")
@@ -431,9 +466,9 @@ def _lock_files(path: Path):
     return [p for p in path.parent.iterdir() if p.suffix.lower() in (".ldb", ".laccdb")]
 
 
-def test_read_only_file_unchanged_and_no_lock_left(access_db):
+def test_read_only_file_unchanged_and_no_lock_left(access_db, reader_kind):
     before = access_db.stat()
-    with open_reader(access_db) as r:
+    with open_reader(access_db, reader=reader_kind) as r:
         for t in r.list_tables():
             r.get_table(t)
             _all_rows(r, t)
@@ -446,7 +481,7 @@ def test_writing_through_reader_connection_is_impossible(access_db, tmp_path):
     copy = tmp_path / access_db.name
     shutil.copy2(access_db, copy)
     before = copy.stat()
-    with open_reader(copy) as r:
+    with open_reader(copy, reader="odbc") as r:  # ODBC-only: the pure reader has no connection
         conn = getattr(r, "_conn", None)
         assert conn is not None, "PyodbcReader no longer exposes _conn; update this test"
         with pytest.raises(pyodbc.Error):
@@ -455,14 +490,14 @@ def test_writing_through_reader_connection_is_impossible(access_db, tmp_path):
             conn.cursor().execute("DROP TABLE NETS")
     after = copy.stat()
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
-    with open_reader(copy) as r:
+    with open_reader(copy, reader="odbc") as r:
         assert r.count_rows("NETS") == 2
         assert "NETS" in r.list_tables()
 
 
-def test_copy_to_temp(access_db):
+def test_copy_to_temp(access_db, reader_kind):
     before = access_db.stat()
-    with open_reader(access_db, copy_to_temp=True) as r:
+    with open_reader(access_db, copy_to_temp=True, reader=reader_kind) as r:
         assert r.count_rows("BIG") == BIG_ROWS
         assert _all_rows(r, "TERMS") == MANIFEST["TERMS"]["rows"]
         # source must not even be opened -> no lock file next to it
@@ -472,17 +507,20 @@ def test_copy_to_temp(access_db):
     assert _lock_files(access_db) == []
 
 
-def test_copy_to_temp_cleans_up(access_db):
+def test_copy_to_temp_cleans_up(access_db, reader_kind):
     import tempfile
 
     tmp = Path(tempfile.gettempdir())
     before = {p.name for p in tmp.glob("acade2sql-*")}
-    r = open_reader(access_db, copy_to_temp=True)
+    r = open_reader(access_db, copy_to_temp=True, reader=reader_kind)
     r.close()
     after = {p.name for p in tmp.glob("acade2sql-*")}
     assert after <= before
 
 
-def test_two_readers_concurrently(access_db):
-    with open_reader(access_db) as a, open_reader(access_db) as b:
+def test_two_readers_concurrently(access_db, reader_kind):
+    with (
+        open_reader(access_db, reader=reader_kind) as a,
+        open_reader(access_db, reader=reader_kind) as b,
+    ):
         assert a.count_rows("COMP") == b.count_rows("COMP") == 5

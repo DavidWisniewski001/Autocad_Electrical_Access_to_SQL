@@ -11,7 +11,7 @@ Findings (driver quirks):
   in that mode CATALOG and DEC become reserved words and must be bracket-quoted.
 """
 
-# ruff: noqa: E501, RUF001, RUF005
+# ruff: noqa: E501, RUF001, RUF003, RUF005
 from __future__ import annotations
 
 import contextlib
@@ -148,6 +148,43 @@ TYPED_ROWS = [
     (2147483647, None, None, None, None, None, None, True, None, None, b"", " pad "),
 ]
 
+# M5: DATETIME edge cases (Access stores days since 1899-12-30 as a double; negative before it,
+# and the time fraction of a negative value is added as a magnitude).
+DATE_ROWS = [
+    dt.datetime(1899, 12, 29, 12, 0, 0),  # day before the epoch, with a time
+    dt.datetime(1899, 12, 29, 0, 0, 0),
+    dt.datetime(1850, 6, 15, 8, 30, 15),
+    dt.datetime(1899, 12, 30, 0, 0, 0),  # the epoch itself
+    dt.datetime(1899, 12, 30, 0, 0, 1),
+    dt.datetime(1899, 12, 31, 18, 0, 0),
+    dt.datetime(1900, 2, 28, 23, 59, 59),
+    dt.datetime(2000, 2, 29, 12, 34, 56),
+    dt.datetime(9999, 12, 31, 23, 59, 59),  # Access maximum
+    None,
+]
+# Dates before the Gregorian reform: parameters overflow, so they go in as #mm/dd/yyyy# literals.
+# They live in their own database (see test_m5_ancient_dates.py): the ODBC driver reads them back
+# with a shifted calendar (1000-01-01 -> 0999-07-02), the file itself holds the exact value.
+ANCIENT_DATES = [dt.datetime(1000, 1, 1), dt.datetime(100, 1, 1)]
+
+
+def build_ancient(path: Path) -> Path:
+    """A tiny database with the ANCIENT_DATES in table DATES (ID COUNTER, D DATETIME)."""
+    path = Path(path)
+    create_empty_db(path)
+    con = connect_rw(path)
+    cur = con.cursor()
+    try:
+        cur.execute("CREATE TABLE DATES (ID COUNTER, D DATETIME)")
+        for d in ANCIENT_DATES:
+            lit = f"{d.month:02d}/{d.day:02d}/{d.year:04d} {d:%H:%M:%S}"
+            cur.execute(f"INSERT INTO [DATES] ([D]) VALUES (#{lit}#)")
+    finally:
+        cur.close()
+        con.close()
+    return path
+
+
 PROJECT_TABLES = {
     "COMP": dict(
         ddl="CREATE TABLE [COMP] (HDL TEXT(20) NOT NULL, TAGNAME TEXT(60), CAT TEXT(60), MFG TEXT(30), "
@@ -241,7 +278,42 @@ HOSTILE = {
     "KRAUS & NAIMER": ["CATALOG"],
     "DO": ["CATALOG"],
     "_PINLIST_BRUNDY/HUBBEL": ["PIN"],
+    "COMMA,NAME": ["CATALOG"],  # M5: a comma is legal in an Access table name
 }
+
+# M5: strings mixing ASCII with characters > U+00FF in every position. The columns are created
+# WITH COMP (Unicode compression), which makes Jet 4 / ACE store them as compressed runs with
+# 0x00 mode toggles (access-parser 0.0.6 mis-decodes these: U+2013 comes back as '\x13').
+UNI_STRINGS = [
+    "A–B",  # toggle in the middle
+    "–",  # only the non-Latin-1 character
+    "x–y–z",  # two toggles
+    "日本語abc",  # starts uncompressed, ends compressed
+    "abc日本",  # starts compressed, ends uncompressed
+    "–" * 50,  # long uncompressed run
+    "a–b–c–d–e",  # alternating
+    "é–é",  # Latin-1 (>0x7F) next to a toggle
+    "abcdef–",  # toggle at the very end
+    "–abcdef",  # toggle at the very start
+    "日a本b語c",  # alternating CJK
+    "µ · – Ω °",  # the ACADE sample
+    "\U0001f600abc",  # surrogate pair then ASCII
+    "abc\U0001f600",
+    "",
+    None,
+    "plain ascii",
+    "€5 – “quoted” …",  # euro, dashes, curly quotes, ellipsis
+]
+UNI_MEMO_LONG = ("abc–" * 1500) + "END"  # > 6000 chars, '–' periodically
+UNI_MEMO_LONG2 = (("x" * 99) + "–") * 60  # 6000 chars, one '–' per 100
+
+
+def uni_rows():
+    """(S, M) pairs; M is the string plus a tail, or one of the long memos."""
+    rows = [(s, None if s is None else s + "tail") for s in UNI_STRINGS]
+    rows.append(("long1", UNI_MEMO_LONG))
+    rows.append(("long2", UNI_MEMO_LONG2))
+    return rows
 
 
 def _hostile_rows(cols):
@@ -310,6 +382,21 @@ def build_manifest() -> dict:
         m[name] = dict(
             count=2, pk=("RECNUM",), pk_source="inferred", columns=["RECNUM"] + cols, rows=rows
         )
+    ur = uni_rows()
+    m["UNIRUNS"] = dict(
+        count=len(ur),
+        pk=("RECNUM",),
+        pk_source="inferred",
+        columns=["RECNUM", "S", "M"],
+        rows=[(i,) + tuple(r) for i, r in enumerate(ur, 1)],
+    )
+    m["DATES"] = dict(
+        count=len(DATE_ROWS),
+        pk=("ID",),
+        pk_source="inferred",
+        columns=["ID", "D"],
+        rows=[(i, d) for i, d in enumerate(DATE_ROWS, 1)],
+    )
     m["TYPED"] = dict(
         count=len(TYPED_ROWS),
         pk=("ID",),
@@ -382,7 +469,7 @@ def build(path: Path) -> Path:
             "CREATE TABLE [ALLEN BRADLEY] (RECNUM COUNTER, [DESC] TEXT(20), [RANGE] TEXT(20), "
             "[DUCT SIZE W x H] TEXT(20), [COIL/VOLTAGE/STYLE] TEXT(20))"
         )
-        for name in ("ALLEN-BRADLEY", "KRAUS & NAIMER", "DO"):
+        for name in ("ALLEN-BRADLEY", "KRAUS & NAIMER", "DO", "COMMA,NAME"):
             cur.execute(f"CREATE TABLE [{name}] (RECNUM COUNTER, [CATALOG] TEXT(20))")
         cur.execute("CREATE TABLE [_PINLIST_BRUNDY/HUBBEL] (RECNUM COUNTER, PIN TEXT(20))")
         for name, cols in HOSTILE.items():
@@ -405,6 +492,16 @@ def build(path: Path) -> Path:
             ["L", "S", "B", "DBL", "RL", "CUR", "DT", "YN", "G", "DEC", "BIN", "TXT"],
             TYPED_ROWS,
         )
+
+        # (d2) compressed-unicode runs (M5)
+        cur.execute(
+            "CREATE TABLE UNIRUNS (RECNUM COUNTER, S TEXT(255) WITH COMP, M MEMO WITH COMP)"
+        )
+        _insert(cur, "UNIRUNS", ["S", "M"], uni_rows())
+
+        # (d3) date edge cases (M5)
+        cur.execute("CREATE TABLE DATES (ID COUNTER, D DATETIME)")
+        _insert(cur, "DATES", ["D"], [(d,) for d in DATE_ROWS])
 
         # (e) big
         cur.execute("CREATE TABLE BIG (RECNUM COUNTER, KEY1 TEXT(20), VAL LONG, TXT TEXT(30))")

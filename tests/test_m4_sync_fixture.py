@@ -3,7 +3,6 @@
 The session fixture file is never touched: a copy is opened read-write, only the copy is modified.
 """
 
-# ruff: noqa: RUF001
 from __future__ import annotations
 
 import datetime as dt
@@ -57,7 +56,7 @@ def _modify(path):
         # NETS: delete everything -> empty source table
         cur.execute("DELETE FROM [NETS]")
         # XX: unicode swaps, ''<->NULL, memo change, deletes, inserts
-        cur.execute("UPDATE [XX] SET [MFG] = ? WHERE [RECNUM] = 2", "Ω · – µ °")
+        cur.execute("UPDATE [XX] SET [MFG] = ? WHERE [RECNUM] = 2", "Ω · – µ °")  # noqa: RUF001
         cur.execute("UPDATE [XX] SET [MFG] = NULL WHERE [RECNUM] = 6")
         cur.execute("UPDATE [XX] SET [DESC1] = '' WHERE [RECNUM] = 7")
         cur.execute("UPDATE [XX] SET [NOTES] = ? WHERE [RECNUM] = 8", ba.LONG_MEMO + " +edit")

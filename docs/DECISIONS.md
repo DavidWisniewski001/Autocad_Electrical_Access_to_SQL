@@ -206,3 +206,157 @@ Each entry: decision — reason. Newest last.
     text format match the pyodbc values. With `column_types=None` (legacy callers) there is no
     GUID or REAL folding at all. Full, sync (rows, keys and the checksum restricted to the source
     keys) and `--no-key replace` pass the types; append computes no checksum.
+37. **Pure reader: access-parser for the TDEF only; rows and values are ours** (M5,
+    `readers/access_parser_reader.py`) — access-parser 0.0.6 (license: Apache-2.0, per its
+    dist-info `LICENSE` file and the "OSI Approved :: Apache Software License" classifier) parses
+    table definitions correctly (`parsing_primitives.parse_table_head`/`parse_table_data`), but its
+    value layer is unusable for us: `utils.parse_type` guesses text as UTF-8/Latin-1 with
+    `errors="ignore"` and ignores compressed-unicode toggles (MS: 260 rows with U+2013 read as
+    `'\x13'`), strips NULs, returns dates/CURRENCY as formatted strings, reads BYTE signed and GUIDs
+    big-endian, mis-masks overflow-row offsets (`end & 0xff != 0` is `end & 1`) and silently drops
+    rows it cannot parse; `AccessParser()` reads the whole file into memory twice. So nothing of it
+    is monkeypatched or subclassed: the reader memory-maps the file read-only (`open(path, "rb")` +
+    `mmap.ACCESS_READ`, no lock file, nothing written) and owns the header, the catalog
+    (`MSysObjects` rows), the usage map (data pages), row slots (`0x8000` deleted/overflow target
+    skipped, `0x4000` followed as an overflow pointer), the null mask, fixed offsets, variable
+    offsets (Jet 3 jump tables as mdbtools), LVAL chains and every value conversion. Rows stream page
+    by page: nothing is cached between calls. One access-parser bug is corrected: the Jet 4 real-index
+    flags byte (unique) is 4 bytes later than access-parser reads it. Verified: every table of both
+    sample databases has the same schema (names, order, access_type, data_type, size,
+    decimal_digits, nullable, indexes, PK) and the same column-aware checksum as ODBC (168/168,
+    117/117; `scripts/compare_readers.py`); pure is faster than ODBC there (MS 14 s vs 24 s
+    including the checksum).
+38. **Jet 4 compressed unicode: one `0x00` toggles; the first code unit of a run is data** (M5,
+    `decode_jet_text`) — raw bytes from Access (fixture UNIRUNS, MS) show `FF FE 41 00 13 20 00 42`
+    for `A–B`: in uncompressed mode a single `0x00` at a code-unit boundary switches back (there is
+    no `00 00` terminator, as M5_SPEC §1 assumed). Rules: start compressed (byte = U+00xx); `00` →
+    uncompressed; the first UTF-16LE unit after a switch is always data (so `00 4E` = U+4E00 is
+    not a toggle); later a `00` at a unit boundary switches back, and a `00 00` pair is accepted as
+    one switch (the spec's form; Access never writes an empty compressed run mid-value). Without
+    `FF FE`: UTF-16LE. Jet 3: the header code page (cp1252 default). All decoding is strict: an odd
+    byte count, a lone surrogate or an undefined code-page byte raises `Acade2SqlError` naming the
+    table and column (the table becomes `error` in convert); never `ignore`/`replace`.
+    Final review finding: Access stores a value *uncompressed* (plain UTF-16LE, no `FF FE`)
+    whenever compression would be ambiguous: any `0x00` byte inside a non-Latin-1 code unit (e.g.
+    U+4E00), a NUL character, 1-character values and multi-chunk MEMOs. So the defensive branches
+    above (first unit after a switch is data, `00 00` as one switch) never trigger on
+    Access-written data; they stay as the strict, non-lossy reading of the format.
+39. **Pure reader reproduces the ODBC value contract and metadata** (M5) — DATETIME: days since
+    1899-12-30, date part truncated toward zero, time = absolute fraction (also before 1899),
+    truncated to whole seconds after adding 1e-4 s: measured on the driver (10.9998 s → 10,
+    10.9999 s → 11, 0.99999999 days → 23:59:59). BIT from the null mask (never None); BYTE unsigned;
+    CURRENCY `Decimal` with 4 decimals; DECIMAL `Decimal` with the column scale (exact digit tuple,
+    no context rounding); GUID `UUID(bytes_le=...)` upper-case unbraced; LONGBINARY/BINARY `bytes`;
+    NUL characters kept. Metadata: ODBC type names/codes/sizes (VARCHAR size in characters,
+    LONGCHAR/LONGBINARY 1073741823, DECIMAL precision/scale from the TDEF); `nullable` as the driver
+    reports it (only COUNTER and BIT NOT NULL, discovered PK columns NOT NULL, #11); indexes from the
+    TDEF logical indexes (foreign-key reference entries skipped), so PK discovery is identical.
+    Catalog objects with flags `0x00030000` (MSysComplexType_* templates) are not listed, as with
+    SQLTables. `count_rows` counts live row slots from the usage map; a difference from the TDEF
+    row count is an error (#43). Type 9 is `BINARY`/-2 when fixed-length
+    (zero-padded, as the driver returns it) and `VARBINARY`/-3 otherwise (verified on a scratch
+    .mdb/.accdb); type 10 is `CHAR`/-8 when fixed-length (`CHAR(n)`), else `VARCHAR`/-9, as the
+    driver reports them. BIGINT (type 19) is fixed 8-byte little-endian; the variable-length form
+    that `CREATE TABLE ... BIGINT` through the ODBC driver produces is decoded as little-endian
+    int64 when the column length is 8 (any other length: the table is refused up front, #41). The
+    driver itself reports that variable form as `CHAR(4)` and returns the 8 bytes as a 4-character
+    string, so this is the one known deliberate difference between the readers (pure is right).
+    Rows written before a variable-length column was added (`ALTER TABLE ... ADD COLUMN`) carry no
+    variable-length offset table: it is parsed only when the row's column count exceeds the lowest
+    variable-length column number (verified on .mdb and .accdb against ODBC). Corrupt offsets
+    (not monotonic, past the row data, or a present column without a slot) raise; a value is never
+    returned as NULL or `''` in their place. **Dates before 1753-01-01 follow the driver, not Access.** The ODBC driver counts
+    back from 1753-01-01 in 365-day years and maps the day of the year with that year's Gregorian
+    month lengths (so 31 December of a leap year never occurs): serial -53689 → 1752-12-30
+    (proleptic Gregorian, which Access/VBA displays: 1752-12-31), `#01/01/1000#` → 0999-07-02,
+    serial -657434 (Access's documented minimum 100-01-01) → 0098-11-26. The pure reader emulates
+    this exactly (`_driver_date_before_1753`; 0 mismatches on 21,382 sampled serials from 0098 to
+    1753, incl. time parts) so that both readers give the same values (sync across readers, the
+    equivalence contract); both therefore differ from what Access displays for such dates. From
+    1753-01-01 on the plain proleptic Gregorian conversion is what the driver does. The sample
+    databases contain no dates before 1753.
+40. **Reader selection and lazy imports** (M5) — `open_reader(path, copy_to_temp=, reader="auto"|
+    "odbc"|"pure")`; `auto` → odbc when `acade2sql.readers.diagnose_driver()` (delegates to
+    `diagnostics.diagnose_driver` at call time) is ok, else pure with exactly one WARNING (speed
+    and how to install the driver). Invalid values → `ValueError` (`convert`: `UsageError`). The
+    reader modules are imported lazily, so the pure path never imports pyodbc (works where pyodbc
+    or unixODBC is missing). `diagnostics` imports pyodbc only inside `diagnose_driver`; when that
+    import fails (`ImportError`/`OSError`) the driver counts as unavailable ("pyodbc not
+    importable", with an install hint that needs no pyodbc): `auto` → pure with the warning,
+    `doctor` marks the odbc reader unusable, `--reader odbc` raises `DriverNotFoundError`. `Reader.kind` (`"odbc"`/`"pure"`) is recorded as `"reader"` in the
+    report JSON and `inspect --json`. access-parser is a core dependency (`>=0.0.6,<0.1`, plus
+    `construct`, imported directly for `ConstructError`); the `fallback` extra remains, empty.
+41. **What the pure reader refuses** (M5) — `UnsupportedAccessFeature(Acade2SqlError)` with the
+    advice to use `--reader odbc` (or, for a password, to remove it: the ODBC reader has no password
+    option either): password-protected databases (password field of the RC4-masked header, key
+    0x6B39DAC7, Jet 4 XOR-masked with the creation date; verified on a .mdb and an .accdb protected
+    with `ALTER DATABASE PASSWORD`), RC4-encoded databases
+    (non-zero encoding key), an unreadable catalog page (ACCDB encryption, corruption), and per
+    table (`get_table`, so convert marks the table `error`): attachment/multi-value (type 18),
+    calculated fields (Jet 4 extended flags `0xC0`), Date/Time Extended (type 20), a
+    variable-length BIGINT whose length is not 8, and unknown types (all before the target table is
+    created).
+    Garbage or empty files, and a file another program holds exclusively (`PermissionError`), raise
+    `Acade2SqlError`. Jet 3 (Access 97) decoding follows mdbtools but has no sample file to verify
+    it.
+42. **CLI and API polish** (M5) — `acade2sql doctor` (Python version/bitness, Access drivers incl.
+    other-bitness registry probe, usable readers, psycopg/pyodbc versions, SQL Server ODBC drivers,
+    package version; exit 0 when a reader is usable). Progress `[i/n] NAME ROWS rows S.Ss` on
+    stderr only, after each table of a real run (`convert(progress=callback)`), on by default when
+    stderr is a TTY, `--progress`/`--no-progress`; ROWS is `source_rows` (else `target_rows`).
+    `--tables-file`/`--exclude-file`: UTF-8 (BOM tolerated), one name per line, stripped, blank and
+    `#` lines ignored, added to `--tables`/`--exclude`; an unreadable file is a usage error (exit
+    2), a tables file with no names too. `--checksum --dry-run` prints `warning: --checksum is
+    ignored with --dry-run` (exit unchanged). `redact()`: structured positions (userinfo, `PWD=`,
+    encoded `PWD%3D`, secret-looking `?key=value` query values) are always masked; free-text
+    occurrences of URL secrets only when the secret has ≥ 4 characters; a `PWD=`/`PASSWORD=`
+    right after `?`/`&` belongs to the query rule (stops at `&`: `?password=ab&sslmode=require` →
+    `?password=***&sslmode=require`), while ODBC `PWD=a&b` is masked up to `;`. Dry-run sync of a
+    keyless table under `--no-key error` lists no actions and prints no DDL for it (the real run
+    stops before touching the target); when no statement remains the DDL section reads `-- DDL:
+    none (no table would be created)`. `doctor` lists every SQL Server ODBC driver but only "ODBC
+    Driver 17/18 for SQL Server" count as ok; legacy ones (the built-in `SQL Server`, Native
+    Client) are shown as "not supported by the writer (install ODBC Driver 17 or 18 for SQL
+    Server)". `python -m acade2sql` runs the CLI. `scripts/compare_readers.py` exits 0 (identical),
+    1 (differences found) or 2 (bad arguments, or a source missing/unopenable; the other sources are
+    still compared and `--json` is still written).
+    `UsageError`, `SchemaError`, `SyncKeyError`, `TargetDataError` are exported from `acade2sql`.
+43. **The pure reader never returns a partial table** (final review) — `count_rows` and
+    `iter_rows` raise `SourceIntegrityError(Acade2SqlError)` naming the table, both row counts and
+    the skipped pages when a page listed in the table's usage map is not a data page owned by the
+    table (raised before any row is yielded), or when the live rows found differ from the row
+    count stored in the TDEF (raised after the last row, inside the table's write transaction).
+    The table becomes `error`; sync rolls back, so `--delete-missing` can never act on a partial
+    read (reviewer repro: owner of the only data page set to 0x7777 → sync ends `error`, target
+    still 45 rows). The TDEF count is trusted because no valid file was found where it differs: 0
+    mismatches on the 285 sample tables, on every reviewer/scratch database, and on scratch files
+    with 1/3 of the rows deleted without compaction, rows grown into overflow rows, MEMOs moved to
+    LVAL pages, and reads while a writer connection was still open (.mdb and .accdb; both readers
+    agreed at every step). Every other failure while locating rows (short usage-map record,
+    overflow slot under 4 bytes, bad page) is an `Acade2SqlError` naming the table and page.
+    **Live writers**: when `<name>.ldb`/`<name>.laccdb` exists next to the source, the pure reader
+    logs one WARNING (someone has the database open, a write in progress can make a table
+    inconsistent: close ACADE or use `--copy-to-temp`); with `copy_to_temp=True` the copy is
+    taken first as always and only an INFO is logged.
+44. **Dates before 1753 get a per-table warning** (final review) — both readers return the
+    driver's calendar there (#39). While rows are written (`modes.load`, reader-neutral) any
+    DATETIME value before 1753-01-01 adds the table warning "dates before 1753 are read using the
+    ODBC driver's calendar and may differ from what Access displays"; the status is unchanged.
+45. **The ODBC reader refuses Access Large Number (BIGINT) columns** (0.3.0 release fix) — the
+    Access ODBC driver reports a Large Number column (TDEF type 19) as `CHAR` with
+    `column_size` 4 (`data_type` -8) and returns each value as a garbage 4-character string; the
+    garbage was converted and even passed `--checksum` (source-as-read == target). Now
+    `PyodbcReader.get_table` and `iter_rows` cross-check every column the driver reports as
+    CHAR(4) (cheap pre-filter: other tables are never cross-checked, and a table is checked once
+    per reader) against the file's table definition, parsed read-only by the pure reader
+    (`access_parser_reader.column_type_codes`: `_JetFile` + catalog + TDEF, no driver, no
+    lock-file warning, no rejection of types the pure reader cannot read). It reads the file the
+    driver opened, i.e. the temporary copy with `copy_to_temp`. A real BIGINT raises
+    `UnsupportedAccessFeature` "column 'C' of table 'T' is an Access Large Number (BIGINT), which
+    the Access ODBC driver misreads; use --reader pure", so convert marks the table `error`
+    (exit 3) before its target table is created; the pure reader reads the values exactly. A
+    genuine CHAR(4) text column passes. If the cross-check itself fails (a file the pure parser
+    cannot handle) a WARNING is logged and the driver's metadata is used, so ODBC reads of such
+    files keep working. `UnsupportedAccessFeature` moved to `acade2sql.errors` (re-exported from
+    `acade2sql.readers.access_parser_reader`); it and `SourceIntegrityError` are exported from
+    `acade2sql`.

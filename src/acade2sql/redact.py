@@ -19,15 +19,22 @@ log = logging.getLogger(__name__)
 
 MASK = "***"
 _ENCODED_MASK = quote(MASK, safe="")  # "%2A%2A%2A": how render_as_string encodes "***"
+MIN_FREE_TEXT_SECRET = 4  # shorter secrets are masked only in structured positions
 
 SECRET_KEY = re.compile(r"(?i)(pass|pwd|secret|token|key)")
 ODBC_CONNECT = "odbc_connect"
 # PWD=/PASSWORD= in an ODBC connection string: a braced value ("}}" escapes "}") or up to ";".
 _ODBC_PWD = re.compile(r"(?i)\b(PWD|PASSWORD)=(\{(?:[^}]|\}\})*\}|[^;]*)")
 # Free-text fallbacks used by redact(): "scheme://user:secret@" and "PWD=secret" (stops at
-# ';', whitespace or a quote so the rest of an exception message survives).
+# ';', whitespace or a quote so the rest of an exception message survives). A PWD=/PASSWORD=
+# right after '?' or '&' is a URL query parameter: _TEXT_QUERY_SECRET owns it (it stops at '&',
+# so "?password=ab&sslmode=require" keeps "&sslmode=require"); ODBC "PWD=a&b" stays fully masked.
 _TEXT_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://[^:/@\s]*):([^@\s/]+)@")
-_TEXT_PWD = re.compile(r"(?i)\b(PWD|PASSWORD)=(\{(?:[^}]|\}\})*\}|[^;\s'\"]*)")
+_TEXT_PWD = re.compile(r"(?i)(?<![?&])\b(PWD|PASSWORD)=(\{(?:[^}]|\}\})*\}|[^;\s'\"]*)")
+# A secret-looking query parameter of a URL inside text: ?password=<value> / &token=<value>.
+_TEXT_QUERY_SECRET = re.compile(
+    r"(?i)([?&][^=&\s#'\"]*(?:pass|pwd|secret|token|key)[^=&\s#'\"]*=)([^&\s#'\"]*)"
+)
 # The same inside a URL-encoded odbc_connect value: PWD%3D<value> up to %3B ("{...}" = %7B...%7D).
 _TEXT_PWD_ENCODED = re.compile(
     r"(?i)(?:(?<=%3B)|(?<![A-Za-z0-9]))(PWD|PASSWORD)%3D(%7B(?:%7D%7D|(?!%7D)[^\s])*%7D|(?:(?!%3B)[^;&\s'\"])*)"
@@ -81,6 +88,12 @@ def _odbc_secrets(value: str) -> Iterable[str]:
 
 
 def _url_secrets(url: str | URL) -> set[str]:
+    """Secrets of ``url`` that are masked wherever they occur (raw and URL-encoded forms).
+
+    Only secrets of at least :data:`MIN_FREE_TEXT_SECRET` characters: masking every ``p`` of a
+    one-letter password would mangle the message. Shorter secrets are still masked in structured
+    positions (userinfo, ``PWD=``, secret query values) by :func:`redact`.
+    """
     parsed = _parse(url)
     secrets: set[str] = set()
     if parsed is None:
@@ -100,21 +113,25 @@ def _url_secrets(url: str | URL) -> set[str]:
                     secrets.update(_odbc_secrets(v))
     expanded: set[str] = set()
     for s in secrets:
-        if s:
+        if len(s) >= MIN_FREE_TEXT_SECRET:
             expanded.update({s, quote(s, safe=""), quote_plus(s, safe="")})
     return expanded
 
 
 def redact(text: str, url: str | URL | None = None) -> str:
-    """Return ``text`` with the secrets of ``url`` (raw and URL-encoded) replaced by ``***``.
+    """Return ``text`` with secrets replaced by ``***``.
 
-    Also masks, independently of ``url``, ``scheme://user:secret@`` userinfo and ``PWD=``/
-    ``PASSWORD=`` values (plain or URL-encoded as ``PWD%3D...``) found in the text itself.
+    Structured positions are always masked, independently of ``url`` and of the secret's length:
+    ``scheme://user:secret@`` userinfo, ``PWD=``/``PASSWORD=`` values (plain or URL-encoded as
+    ``PWD%3D...``) and secret-looking URL query values (``?password=...``). Free-text occurrences
+    of the secrets of ``url`` (raw and URL-encoded) are masked too, but only for secrets of 4 or
+    more characters, so a short password does not mangle ordinary words.
     """
     out = str(text)
     if url is not None:
         for secret in sorted(_url_secrets(url), key=len, reverse=True):
             out = out.replace(secret, MASK)
+    out = _TEXT_QUERY_SECRET.sub(lambda m: f"{m.group(1)}{MASK}", out)
     out = _TEXT_USERINFO.sub(lambda m: f"{m.group(1)}:{MASK}@", out)
     out = _TEXT_PWD.sub(lambda m: f"{m.group(1)}={MASK}", out)
     out = _TEXT_PWD_ENCODED.sub(lambda m: f"{m.group(1)}%3D{MASK}", out)

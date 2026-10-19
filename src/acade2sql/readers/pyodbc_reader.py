@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import shutil
-import tempfile
-import time
 from collections.abc import Callable, Iterator
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pyodbc
 
 from acade2sql.diagnostics import require_driver, translate_connect_error
-from acade2sql.errors import Acade2SqlError, SourceNotFoundError, TableNotFoundError
-from acade2sql.readers.base import Reader
-from acade2sql.schema import ColumnInfo, IndexInfo, PrimaryKeySource, TableInfo
+from acade2sql.errors import Acade2SqlError, UnsupportedAccessFeature
+from acade2sql.readers.base import (
+    ACCESS_SUFFIXES,
+    PRIMARY_KEY_INDEX,
+    Reader,
+    TempCopy,
+    build_table_info,
+    check_batch_size,
+    resolve_table,
+    validate_source,
+)
+from acade2sql.schema import ColumnInfo, IndexInfo, TableInfo
 
 # Requirement 10: no ODBC connection pooling, so closing the reader really releases the Access file
 # (and its .ldb lock). Set at import time, before the first pyodbc.connect() in the process.
@@ -25,12 +30,14 @@ pyodbc.pooling = False
 
 log = logging.getLogger(__name__)
 
-ACCESS_SUFFIXES = frozenset({".mdb", ".accdb"})
-PRIMARY_KEY_INDEX = "primarykey"
+__all__ = ["ACCESS_SUFFIXES", "PRIMARY_KEY_INDEX", "PyodbcReader", "quote_access"]
+
 _BINARY_TYPES = frozenset({"LONGBINARY", "BINARY", "VARBINARY"})
+# The Access ODBC driver reports a Large Number (BIGINT) column as CHAR(4) and returns its values
+# as garbage 4-character strings (DECISIONS #45). Such columns are cross-checked against the TDEF.
+_SUSPECT_TYPE, _SUSPECT_SIZE = "CHAR", 4
+_TDEF_BIGINT = 19
 _SQL_NULLABLE = 1
-_CLEANUP_RETRIES = 10
-_CLEANUP_DELAY_S = 0.2
 
 
 def quote_access(name: str) -> str:
@@ -45,28 +52,25 @@ def _odbc_value(value: str) -> str:
     return value
 
 
-def _validate_source(path: Path) -> Path:
-    if path.suffix.lower() not in ACCESS_SUFFIXES:
-        raise SourceNotFoundError(f"Not an Access database (expected .mdb or .accdb): {path}")
-    if not path.is_file():
-        raise SourceNotFoundError(f"Access database not found: {path}")
-    return path.resolve()
-
-
 class PyodbcReader(Reader):
     """Access reader using ``pyodbc`` with ``ReadOnly=1`` and ``readonly=True``."""
 
+    kind = "odbc"
+
     def __init__(self, path: str | Path, *, copy_to_temp: bool = False) -> None:
         self.path = Path(path)
-        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._temp: TempCopy | None = None
         self._conn: pyodbc.Connection | None = None
         self._tables: dict[str, list[str]] | None = None
         self._cursors: set[pyodbc.Cursor] = set()
-        source = _validate_source(self.path)
+        self._checked: set[str] = set()  # tables that passed the BIGINT cross-check
+        source = validate_source(self.path)
         driver = require_driver()
         try:
             if copy_to_temp:
-                source = self._copy_to_temp(source)
+                self._temp = TempCopy(source)
+                source = self._temp.path
+            self._source = source  # the file actually opened (the temp copy with copy_to_temp)
             self._conn = self._connect(driver, source)
         except BaseException:
             self.close()
@@ -74,13 +78,6 @@ class PyodbcReader(Reader):
         log.debug("opened access db", extra={"kv": {"path": str(self.path), "copy": copy_to_temp}})
 
     # -- lifecycle -----------------------------------------------------------------------------
-
-    def _copy_to_temp(self, source: Path) -> Path:
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="acade2sql_", ignore_cleanup_errors=True)
-        target = Path(self._tmpdir.name) / source.name
-        shutil.copy2(source, target)
-        log.debug("copied source to temp", extra={"kv": {"temp": str(target)}})
-        return target
 
     @staticmethod
     def _connect(driver: str, source: Path) -> pyodbc.Connection:
@@ -99,23 +96,10 @@ class PyodbcReader(Reader):
             except pyodbc.Error:  # pragma: no cover - already broken connection
                 log.debug("error while closing connection", exc_info=True)
             self._conn = None
-        if self._tmpdir is not None:
-            tmp = Path(self._tmpdir.name)
-            copies = list(tmp.iterdir()) if tmp.is_dir() else []
-            self._tmpdir.cleanup()  # ignore_cleanup_errors=True: never raises
-            self._tmpdir = None
-            # The Access driver can hold the copied file for a moment after close; retry briefly.
-            for _ in range(_CLEANUP_RETRIES):
-                if not tmp.exists():
-                    break
-                time.sleep(_CLEANUP_DELAY_S)
-                shutil.rmtree(tmp, ignore_errors=True)
-            leftover = [p for p in copies if p.exists()]
-            if leftover:
-                log.warning(
-                    "temporary copy of the source could not be removed",
-                    extra={"kv": {"path": str(leftover[0])}},
-                )
+        if self._temp is not None:
+            # The Access driver can hold the copied file for a moment after close: cleanup retries.
+            self._temp.cleanup()
+            self._temp = None
 
     def _cursor(self) -> pyodbc.Cursor:
         if self._conn is None:
@@ -159,14 +143,7 @@ class PyodbcReader(Reader):
 
         System tables (MSys*) are not resolvable: the driver denies reading them anyway.
         """
-        known = self.list_tables()
-        if name in known:
-            return name
-        folded = name.casefold()
-        matches = [n for n in known if n.casefold() == folded]
-        if len(matches) == 1:
-            return matches[0]
-        raise TableNotFoundError(f"Table {name!r} not found in {self.path}")
+        return resolve_table(name, self.list_tables(), self.path)
 
     def _columns(self, table: str) -> tuple[ColumnInfo, ...]:
         cur = self._cursor()
@@ -214,36 +191,51 @@ class PyodbcReader(Reader):
             for n, cols in grouped.items()
         )
 
-    @staticmethod
-    def _primary_key(
-        columns: tuple[ColumnInfo, ...], indexes: tuple[IndexInfo, ...]
-    ) -> tuple[tuple[str, ...], PrimaryKeySource]:
-        """DECISIONS #6: 'PrimaryKey' unique index -> single COUNTER column -> none."""
-        for idx in indexes:
-            if idx.unique and idx.name.casefold() == PRIMARY_KEY_INDEX:
-                return idx.columns, "discovered"
-        counters = [c.name for c in columns if c.autoincrement]
-        if len(counters) == 1:
-            return (counters[0],), "inferred"
-        return (), "none"
+    def _checked_columns(self, table: str) -> tuple[ColumnInfo, ...]:
+        """:meth:`_columns`, refusing a table whose CHAR(4) column is really a BIGINT."""
+        columns = self._columns(table)
+        if table not in self._checked:
+            self._check_bigint(table, columns)
+            self._checked.add(table)
+        return columns
+
+    def _check_bigint(self, table: str, columns: tuple[ColumnInfo, ...]) -> None:
+        """Raise :class:`UnsupportedAccessFeature` for a Large Number column the driver misreads.
+
+        Only tables with a column the driver reports as CHAR(4) are checked (cheap pre-filter);
+        the real type comes from the file's table definition, parsed read-only by the pure
+        reader. When that parse fails the driver's metadata is kept (WARNING).
+        """
+        suspects = [
+            c.name for c in columns if c.access_type == _SUSPECT_TYPE and c.size == _SUSPECT_SIZE
+        ]
+        if not suspects:
+            return
+        try:
+            from acade2sql.readers.access_parser_reader import column_type_codes
+
+            codes = column_type_codes(self._source, table)
+        except Exception as exc:  # never break ODBC reads over the cross-check
+            log.warning(
+                "cannot cross-check CHAR(4) columns against the table definition; using the "
+                "driver's metadata (a Large Number column would be misread)",
+                extra={"kv": {"table": table, "columns": suspects, "error": exc}},
+            )
+            return
+        folded = {k.casefold(): v for k, v in codes.items()}
+        for name in suspects:
+            code = codes.get(name, folded.get(name.casefold()))
+            if code == _TDEF_BIGINT:
+                raise UnsupportedAccessFeature(
+                    f"column {name!r} of table {table!r} is an Access Large Number (BIGINT), "
+                    "which the Access ODBC driver misreads; use --reader pure"
+                )
 
     def get_table(self, name: str) -> TableInfo:
         table = self._resolve(name)
-        columns = self._columns(table)
-        indexes = self._indexes(table)
-        pk, source = self._primary_key(columns, indexes)
-        if source == "discovered":
-            # The driver reports every non-COUNTER column as nullable, but Access PK columns
-            # can never hold NULL.
-            pk_cols = set(pk)
-            columns = tuple(replace(c, nullable=False) if c.name in pk_cols else c for c in columns)
-        return TableInfo(
-            name=table,
-            columns=columns,
-            primary_key=pk,
-            primary_key_source=source,
-            indexes=indexes,
-        )
+        # The driver reports every non-COUNTER column as nullable, but Access PK columns can
+        # never hold NULL: build_table_info makes discovered PK columns NOT NULL.
+        return build_table_info(table, self._checked_columns(table), self._indexes(table))
 
     # -- data ----------------------------------------------------------------------------------
 
@@ -257,10 +249,9 @@ class PyodbcReader(Reader):
         return int(row[0])
 
     def iter_rows(self, name: str, batch_size: int = 5000) -> Iterator[list[tuple]]:
-        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
-            raise ValueError(f"batch_size must be an integer >= 1, got {batch_size!r}")
+        check_batch_size(batch_size)
         table = self._resolve(name)
-        return self._stream(table, self._columns(table), batch_size)
+        return self._stream(table, self._checked_columns(table), batch_size)
 
     def _stream(
         self, table: str, columns: tuple[ColumnInfo, ...], batch_size: int

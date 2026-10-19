@@ -63,6 +63,8 @@ def _actions(opts: RunOptions, key: tuple[str, ...] | None) -> list[str]:
         return ["drop", "create", "insert"]
     if opts.mode == "append":
         return ["create-if-missing", "append"]
+    if key is None and opts.no_key == "error":
+        return []  # the real run stops with "no key for sync" before touching the target
     actions = ["create-if-missing", "upsert" if key else "replace-rows"]
     if opts.delete_missing and key:
         actions.append("delete-missing")
@@ -84,17 +86,20 @@ def _plan_table(
         table = build_table(metadata, info, ddl.dialect, used_index_names=used)
         res.warnings.extend(table.info.get("warnings", ()))
         key: tuple[str, ...] | None = None
+        skipped = False
         if opts.mode == "sync":
             key = key_for(info, opts.keys)
             res.key = list(key) if key else None
             if key is None and opts.no_key == "error":
                 res.status, res.error = "error", NO_KEY_MESSAGE
+                skipped = True  # the real run never creates it: no DDL is shown for it
         res.actions = _actions(opts, key)
         if table.info.get("error"):
             res.status, res.error = "error", str(table.info["error"])
         if opts.mode == "full":
             ddl.drop(table)
-        ddl.create(table)
+        if not skipped:
+            ddl.create(table)
         if counts:
             res.source_rows = read(lambda: reader.count_rows(info.name))
         if unmapped and res.status == "planned":  # DECISIONS #21, as in the real run

@@ -1,17 +1,24 @@
 # acade2sql usage guide
 
-Task-oriented examples for acade2sql 0.2.0. For every option and default, see the
+Task-oriented examples for acade2sql 0.3.0. For every option and default, see the
 [CLI reference](CLI.md). For installation, see the [README](../README.md#installation).
 
 All examples were run against the synthetic test database built by
 `tests/fixtures/build_access.py`. Output is pasted from those runs and trimmed where marked `...`.
+Examples recorded with 0.2.0 show the fixture's 16 tables of that time; the 0.3.0 fixture has 19.
 Where a target had to be "out of date", a copy of the SQLite target was edited with Python's
 `sqlite3`; the Access source was never changed. SQL Server and PostgreSQL examples use `--dry-run`
 with placeholder credentials and did not connect to any server.
 
+- [Check your machine with doctor](#check-your-machine-with-doctor)
+- [Convert on a machine without the Access driver](#convert-on-a-machine-without-the-access-driver)
+- [Choose a reader](#choose-a-reader)
+- [Compare the two readers](#compare-the-two-readers)
 - [Convert a catalog to SQLite](#convert-a-catalog-to-sqlite)
+- [Watch progress](#watch-progress)
 - [Look before you convert](#look-before-you-convert)
 - [Convert selected tables](#convert-selected-tables)
+- [Convert the tables listed in a file](#convert-the-tables-listed-in-a-file)
 - [Verify every value with checksums](#verify-every-value-with-checksums)
 - [Sync a project database](#sync-a-project-database)
 - [Choose a sync key](#choose-a-sync-key)
@@ -25,6 +32,7 @@ with placeholder credentials and did not connect to any server.
 - [Use the Python API](#use-the-python-api)
 - [Fix "Access ODBC driver was not found"](#fix-access-odbc-driver-was-not-found)
 - [Avoid the lock file with --copy-to-temp](#avoid-the-lock-file-with---copy-to-temp)
+- [Fix "the source database appears to be open in another program"](#fix-the-source-database-appears-to-be-open-in-another-program)
 - [Query the result in SQLite](#query-the-result-in-sqlite)
 - [Troubleshoot a failed table](#troubleshoot-a-failed-table)
 - [Fix "keys that differ only by case/trailing spaces"](#fix-keys-that-differ-only-by-casetrailing-spaces)
@@ -32,10 +40,171 @@ with placeholder credentials and did not connect to any server.
 
 ## Your source files are safe
 
-acade2sql opens every Access file **read-only** and never writes to it. While it reads, the Access
-driver creates a temporary lock file next to the source (see
+acade2sql opens every Access file **read-only** and never writes to it, with either reader. While
+the ODBC reader reads, the Access driver creates a temporary lock file next to the source (see
 [Avoid the lock file](#avoid-the-lock-file-with---copy-to-temp)). That lock file is the only thing
-created next to the source, and it is removed when the run ends.
+created next to the source, and it is removed when the run ends. The pure reader creates nothing
+next to the source.
+
+## Check your machine with doctor
+
+```text
+> acade2sql doctor
+ok acade2sql                0.3.0
+ok Python                   3.13.15 (64-bit) C:\...\python.exe
+ok Access ODBC drivers      Microsoft Access Driver (*.mdb, *.accdb)
+ok Access driver 32-bit     not installed
+ok odbc reader              OK: 'Microsoft Access Driver (*.mdb, *.accdb)' is available to this 64-bit Python.
+ok pure reader              access-parser 0.0.6, no driver needed
+ok psycopg (PostgreSQL)     3.3.6
+ok pyodbc (SQL Server)      5.3.0
+-- SQL Server ODBC drivers  SQL Server: not supported by the writer (install ODBC Driver 17 or 18 for SQL Server)
+usable readers: odbc, pure (--reader auto uses odbc)
+```
+
+How to read it:
+- `usable readers` says what `--reader auto` will use. With `odbc` in the list, the Access driver
+  works.
+- `Access driver 32-bit ... installed (cannot be used by this Python)` means you installed the
+  driver of the wrong bitness (see [Fix "Access ODBC driver was not found"](#fix-access-odbc-driver-was-not-found)).
+- `SQL Server ODBC drivers` matters only for SQL Server targets. The Windows built-in `SQL Server`
+  driver shown above is not supported by the writer; install "ODBC Driver 18 for SQL Server".
+- `psycopg` matters only for PostgreSQL targets.
+- The exit code is 0 when at least one Access reader is usable, else 1.
+
+`python -m acade2sql doctor` does the same, which helps when the `acade2sql` command is not on
+`PATH`.
+
+## Convert on a machine without the Access driver
+
+You do not need the Microsoft Access Database Engine. Without it, the default `--reader auto` uses
+the pure-Python reader and logs one warning (on stderr) per run:
+
+```text
+> acade2sql convert fixture.accdb --tables NETS --target out/nodrv.sqlite
+2026-10-19T09:53:03.159 WARNING acade2sql.readers Microsoft Access ODBC driver not usable; falling back to the pure-Python reader (--reader pure). It returns the same data; its speed is comparable on the ACADE sample databases but can differ on other files, and it refuses password-protected/encrypted databases and attachment/calculated fields. To use the reference ODBC reader, install the driver ('Microsoft Access Database Engine 2016 Redistributable', https://www.microsoft.com/en-us/download/details.aspx?id=54920; check with: acade2sql doctor). The Microsoft Access ODBC driver 'Microsoft Access Driver (*.mdb, *.accdb)' was not found for this 64-bit Python. ...
+PASS NETS source=2 target=2
+1 tables: 1 passed, 0 failed, 0 errors
+```
+
+(Recorded with the driver hidden from Python, to simulate such a machine.)
+
+To skip the check and the warning, ask for the pure reader directly:
+
+```text
+acade2sql convert "C:\ACADE\Catalogs\default_cat.mdb" --reader pure --target C:\out\cat.sqlite --checksum
+```
+
+On `default_cat.mdb` this passed all 168 tables, including the checksum of every value. The
+`--checksum` re-read uses the same reader, so it confirms the target matches what the pure reader
+read; [Compare the two readers](#compare-the-two-readers) shows how it was checked against the
+ODBC driver.
+
+Things to know:
+- The report records `"reader": "pure"`, so you can tell later which reader produced a target.
+- Password-protected and encrypted databases stop with exit 1:
+  `error: Cannot read <path>: the database is password-protected, which acade2sql does not support. Remove the password in Access (File > Info > Decrypt Database / Unset Database Password) or convert a copy without one.`
+- A table with an attachment, multi-value, calculated or Date/Time Extended field is `ERROR`
+  (`read failed: ...`) and the other tables are converted (exit 3). Such tables need the ODBC
+  reader. The ACADE sample databases have none.
+- The pure reader never returns part of a table. If the pages it finds do not match the row count
+  Access stored for the table, that table is `ERROR` (`SourceIntegrityError`) and nothing of it is
+  written (a sync of it is rolled back).
+- Even without the driver, pyodbc is installed as a dependency; the pure reader never imports it.
+
+## Choose a reader
+
+| You have | Use |
+|---|---|
+| The Access driver, ordinary ACADE files | `--reader auto` (default), which uses the driver |
+| No Access driver (no admin rights, Office bitness conflict) | `--reader auto` or `--reader pure` |
+| A file with Access "Large Number" (`BIGINT`) columns | `--reader pure` (the ODBC driver misreads them) |
+| A file with attachment, multi-value or calculated fields | `--reader odbc` |
+| A database that ACADE may have open | either reader with `--copy-to-temp` |
+
+Check which reader a run used: `"reader"` in the `--report` file or in `inspect --json`:
+
+```text
+> acade2sql inspect fixture.mdb --reader pure --json --no-counts --table NETS
+{
+  "source": "fixture.mdb",
+  "reader": "pure",
+  "tables": [
+...
+```
+
+`--reader odbc` on a machine without the driver stops with exit 1 and the installer to use (see
+[Fix "Access ODBC driver was not found"](#fix-access-odbc-driver-was-not-found)). If pyodbc itself
+cannot be imported, the message is
+`error: pyodbc not importable (...); the ODBC reader cannot be used. Install pyodbc ('python -m pip install pyodbc'; ...) or use --reader pure.`
+
+**Large Number columns.** The ODBC driver reports an Access "Large Number" column as `CHAR(4)` and
+returns meaningless text. To keep that text out of the target, the ODBC reader checks the file's own
+table definition whenever the driver reports a `CHAR(4)` column. It refuses a table whose column is
+really a Large Number: the table ends with status `error` (exit 3), no target table is created for
+it, and the message says to use `--reader pure`. Genuine 4-character text columns are not affected.
+From a scratch database with one Large Number value `1234567890123`:
+
+```text
+> acade2sql inspect scratch.accdb --reader odbc --table BIGT
+...
+    2  N                        CHAR                4  yes
+> acade2sql inspect scratch.accdb --reader pure --table BIGT
+...
+    2  N                        BIGINT             19  yes
+```
+
+Converting with `--reader pure` writes `1234567890123`. With `--reader odbc` the `BIGT` table fails
+with `column 'N' of table 'BIGT' is an Access Large Number (BIGINT), which the Access ODBC driver
+misreads; use --reader pure`.
+
+## Compare the two readers
+
+`scripts/compare_readers.py` (in the repository, not installed as a command) reads every table with
+both readers and compares the column names, order and types, the row count and a checksum of all
+values. It needs the Access driver, and it writes nothing next to the source when you add
+`--copy-to-temp`.
+
+```text
+> python scripts/compare_readers.py fixture.mdb fixture.accdb --copy-to-temp --json out/cmp.json
+== fixture.mdb  (19 tables)
+[1/19] same _PINLIST_BRUNDY/HUBBEL rows=2 odbc=0.0s pure=0.0s
+[2/19] same _PINLIST_XX rows=40 odbc=0.0s pure=0.0s
+...
+== fixture.mdb: 19/19 identical; tables with schema notes: 0; time odbc=0.1s pure=0.1s
+== fixture.accdb  (19 tables)
+...
+== fixture.accdb: 19/19 identical; tables with schema notes: 0; time odbc=0.1s pure=0.1s
+```
+
+Results on the sample databases (with checksums):
+
+| Source | Identical | ODBC | Pure |
+|---|---|---|---|
+| `footprint_lookup.accdb` | 117 / 117 | 3.4 s | 3.7 s |
+| `default_cat.mdb` | 168 / 168 | 128.7 s | 81.6 s |
+
+A difference looks like this (the Large Number table from [Choose a reader](#choose-a-reader); a
+missing table name is reported the same way):
+
+```text
+> python scripts/compare_readers.py scratch.accdb --tables BIGT OLDD NOPE --copy-to-temp
+== scratch.accdb  (3 tables)
+[1/3] DIFF BIGT rows=1 odbc=0.0s pure=0.0s
+    difference: schema: odbc=[('ID', 1, 'COUNTER'), ('N', 2, 'CHAR')] pure=[('ID', 1, 'COUNTER'), ('N', 2, 'BIGINT')]
+    difference: checksum differs
+[2/3] same OLDD rows=1 odbc=0.0s pure=0.0s
+[3/3] DIFF NOPE rows=None
+    difference: odbc failed: TableNotFoundError: Table 'NOPE' not found in scratch.accdb
+    difference: pure failed: TableNotFoundError: Table 'NOPE' not found in scratch.accdb
+== scratch.accdb: 1/3 identical; tables with schema notes: 1; time odbc=0.0s pure=0.0s
+```
+
+- Exit code 0: every table identical; 1: at least one difference; 2: bad arguments or a source
+  that cannot be opened (the other sources are still compared, and `--json` is still written).
+- `-v` also prints schema notes (differences in size, nullable, indexes and similar fields that do
+  not affect the data).
+- `--tables` takes exact, space-separated names (no comma splitting).
 
 ## Convert a catalog to SQLite
 
@@ -76,6 +245,30 @@ unset ACADE2SQL_TARGET
 
 Check that the two databases have no table names in common first. A footprint table with the same
 name as a catalog table (compared case-insensitively) would replace the catalog table.
+
+## Watch progress
+
+When you run `convert` in a terminal, a line appears on stderr as each table finishes. The
+per-table result lines and the summary are printed to stdout at the end:
+
+```text
+> acade2sql convert fixture.accdb --reader pure --target out/pure.sqlite --checksum --report out/pure.json --progress
+[1/19] _PINLIST_BRUNDY/HUBBEL 2 rows 0.0s
+[2/19] _PINLIST_XX 40 rows 0.0s
+...
+[5/19] BIG 12345 rows 0.2s
+...
+[19/19] XX 40 rows 0.0s
+target=sqlite:///C:\...\out\pure.sqlite rows=12489 elapsed=0.3s rows_per_s=39807
+PASS _PINLIST_BRUNDY/HUBBEL source=2 target=2 checksum=match
+...
+19 tables: 19 passed, 0 failed, 0 errors
+```
+
+- Progress is on by default only when stderr is a terminal. In a script or with stderr redirected
+  it is off; `--progress` forces it on, `--no-progress` off.
+- It never goes to stdout, so `> result.txt` still captures only the results.
+- A dry run prints no progress lines.
 
 ## Look before you convert
 
@@ -157,8 +350,53 @@ Rules:
 - If the filters leave nothing to convert, the tool prints `warning: no tables selected` and exits 0.
 - Quoting is the same in PowerShell and bash: wrap names with spaces, `/` or `&` in double quotes
   (`"KRAUS & NAIMER"`). A table name that contains a comma cannot be selected with `--tables`,
-  because the comma splits it.
+  because the comma splits it (`--tables COMMA,NAME` gives
+  `error: Table(s) not found in source: COMMA, NAME`). Use a
+  [tables file](#convert-the-tables-listed-in-a-file) for such names.
 - An empty name (`--tables "NETS,,COMP"`) is a usage error (exit 2).
+
+## Convert the tables listed in a file
+
+For a long or recurring selection, put the names in a UTF-8 text file, one per line. Blank lines and
+lines starting with `#` are ignored, and commas are part of the name:
+
+```text
+# project tables
+COMP
+NETS
+
+COMMA,NAME
+```
+
+```text
+> acade2sql convert fixture.accdb --reader pure --tables-file tables.txt --exclude-file skip.txt --target out/tf.sqlite --no-progress
+PASS COMMA,NAME source=2 target=2
+PASS COMP source=5 target=5
+2 tables: 2 passed, 0 failed, 0 errors
+```
+
+Here `skip.txt` contains the single line `NETS`, so `--exclude-file` removed it.
+
+- The file's names are added to any `--tables` (or `--exclude`) names on the command line:
+  `--tables-file tables.txt --tables WIRENO` converts four tables.
+- Names are matched case-insensitively, and an unknown name in a tables file stops the run (exit 1),
+  as with `--tables`. Unknown names in an exclude file are ignored.
+- Exit 2: `error: cannot read --tables-file nope.txt: No such file or directory`, a file that is not
+  UTF-8, or `error: --tables-file empty.txt lists no table names`.
+- Files saved by Notepad with a UTF-8 byte-order mark work. Windows PowerShell 5.1's `>` and
+  `Out-File` write UTF-16, which is rejected
+  (`error: --tables-file u16.txt is not UTF-8: 'utf-8' codec can't decode byte 0xff in position 0: ...`).
+  Write the file with an explicit encoding instead:
+
+  ```powershell
+  "COMP", "NETS" | Set-Content -Encoding utf8 tables.txt
+  ```
+
+  bash:
+
+  ```bash
+  printf 'COMP\nNETS\n' > tables.txt
+  ```
 
 ## Verify every value with checksums
 
@@ -254,13 +492,15 @@ dry run (`key=` column):
 ```text
 > acade2sql convert fixture.accdb --target out/sync.sqlite --mode sync --dry-run --no-counts --tables COMP TERMS PNLCOMP
 PLANNED COMP source=- target=- key=HDL actions=create-if-missing,upsert
-ERROR PNLCOMP source=- target=- key=- actions=create-if-missing,replace-rows error=no key for sync; use --key or --no-key replace
+ERROR PNLCOMP source=- target=- key=- error=no key for sync; use --key or --no-key replace
 PLANNED TERMS source=- target=- key=HDL,TERM actions=create-if-missing,upsert
 3 tables: 0 passed, 0 failed, 1 errors, 2 planned
 ...
 ```
 
-(The dry run exits 3 here because `PNLCOMP` has no key.)
+(The dry run exits 3 here because `PNLCOMP` has no key. Since 0.3.0 such a table shows no actions
+and gets no `CREATE TABLE` in the DDL, because the real run would not create it. With
+`--no-key replace` it shows `actions=create-if-missing,replace-rows`.)
 
 Order of precedence:
 
@@ -370,7 +610,8 @@ CREATE INDEX [ix__PINLIST_XX_IDX_CAT] ON [_PINLIST_XX] ([CATALOG], [ASSEMBLYCODE
 - `--no-counts` skips counting the source rows. A dry run of `default_cat.mdb` for a SQL Server or
   PostgreSQL URL took about 0.7 s and printed 168 `CREATE TABLE` and 165 `CREATE INDEX` statements,
   with no SQL Server index skipped.
-- The password is masked in all output.
+- The password is masked in all output, however short it is.
+- `--checksum` has no effect in a dry run; it prints `warning: --checksum is ignored with --dry-run`.
 - Exit code 0 means every table is `PLANNED`. A table the real run would fail on (no sync key,
   unknown key column, SQL Server primary key too large, unmapped Access type) is `ERROR` or `FAIL`,
   and the exit code is 3.
@@ -594,14 +835,35 @@ WIRENO pass 3 3 True
 - `convert()` takes the same options as the CLI: `mode="full"` (or `"append"`, `"sync"`), `tables`,
   `exclude`, `batch_size=5000`, `checksum=False`, `copy_to_temp=False`, `report_path=None`,
   `key=None` (a string or a list of `--key` specs), `no_key="error"`, `delete_missing=False`,
-  `schema=None`, `dry_run=False`, `counts=True`.
-- Invalid option combinations raise `acade2sql.errors.UsageError` (a `ValueError`) before anything
-  is opened.
+  `schema=None`, `dry_run=False`, `counts=True`, `reader="auto"` (or `"odbc"`, `"pure"`) and
+  `progress=None`. `report.reader` is the reader that was used.
+- `progress` is a function called after each table of a real run with `(result, index, total)`:
+
+  ```python
+  def show(res, i, n):
+      print(f"{i}/{n} {res.name} {res.status}")
+
+  report = convert("fixture.accdb", "out/api.sqlite", tables=["NETS", "WIRENO"],
+                   reader="pure", progress=show)
+  print(report.ok, report.reader)
+  ```
+
+  ```text
+  1/2 NETS pass
+  2/2 WIRENO pass
+  True pure
+  ```
+- Invalid option combinations raise `acade2sql.UsageError` (a `ValueError`) before anything is
+  opened.
 - Problems found before anything is written raise an exception derived from
   `acade2sql.Acade2SqlError`: `SourceNotFoundError`, `DriverNotFoundError` (and its subclass
-  `BitnessMismatchError`), `TableNotFoundError`, `TargetError`, or `acade2sql.errors.SchemaError`
-  (PostgreSQL name over 63 bytes). Per-table problems do not raise. They appear as
-  `status == "fail"` or `"error"` in `report.tables`.
+  `BitnessMismatchError`), `TableNotFoundError`, `TargetError`, or `SchemaError` (PostgreSQL name
+  over 63 bytes). Per-table problems do not raise. They appear as `status == "fail"` or `"error"`
+  in `report.tables`.
+- Since 0.3.0, `UsageError`, `SchemaError`, `SyncKeyError` and `TargetDataError` can be imported
+  directly from `acade2sql` (they remain in `acade2sql.errors`). `SourceIntegrityError` and
+  `UnsupportedAccessFeature` are exported from `acade2sql` as well (both live in
+  `acade2sql.errors`). All of them derive from `Acade2SqlError`.
 - Each `TableResult` also has `inserted`, `updated`, `deleted`, `unchanged`, `extra_rows`,
   `target_rows_before`, `key` and `actions` (see the [report fields](CLI.md#json-report)).
 
@@ -630,7 +892,8 @@ Read an Access file directly:
 ```python
 from acade2sql import open_reader
 
-with open_reader("fixture.accdb") as r:          # read-only; copy_to_temp=True is also accepted
+with open_reader("fixture.accdb") as r:          # read-only; copy_to_temp=True and reader="pure" also accepted
+    print(r.kind)                                # 'odbc' or 'pure'
     print(r.list_tables()[:3])                   # ['_PINLIST_BRUNDY/HUBBEL', '_PINLIST_XX', 'ALLEN BRADLEY']
     print(r.count_rows("big"))                   # 12345 (names are case-insensitive)
     info = r.get_table("NETS")                   # columns, primary_key, primary_key_source, indexes
@@ -646,13 +909,19 @@ this 64-bit Python. Install the 64-bit (x64) 'Microsoft Access Database Engine 2
 (accessdatabaseengine_X64.exe) from https://www.microsoft.com/en-us/download/details.aspx?id=54920 ...
 ```
 
+Since 0.3.0 this is an error only with `--reader odbc`. With the default `--reader auto` the same
+text appears at the end of a WARNING, and the run continues with the pure reader (see
+[Convert on a machine without the Access driver](#convert-on-a-machine-without-the-access-driver)).
+If you cannot install the driver, use `--reader pure` and stop here. To install it:
+
 1. Check Python's bitness: `python -c "import struct; print(struct.calcsize('P') * 8)"`.
 2. Install the Access Database Engine 2016 Redistributable **of that bitness**:
    `accessdatabaseengine_X64.exe` for 64-bit, `accessdatabaseengine.exe` for 32-bit.
 3. If a different-bitness Office blocks the installer, run it from an administrator prompt with
    `/quiet` (for example `accessdatabaseengine_X64.exe /quiet`), or install a Python of the other
    bitness.
-4. Check that the driver is visible to Python:
+4. Check that the driver is visible to Python: `acade2sql doctor` should show
+   `ok odbc reader` and `usable readers: odbc, pure`. Or directly:
 
    ```text
    python -c "import pyodbc; print([d for d in pyodbc.drivers() if 'Access' in d])"
@@ -665,6 +934,8 @@ mismatch)"*, a driver exists but has the wrong bitness. Follow steps 2 and 3.
 The older `Microsoft Access Driver (*.mdb)` (Jet only) is not enough: it cannot open `.accdb` files.
 
 ## Avoid the lock file with --copy-to-temp
+
+This section is about the ODBC reader. The pure reader (`--reader pure`) never creates a lock file.
 
 Even in read-only mode, the Access driver creates `<name>.ldb` (for `.mdb`) or `<name>.laccdb` (for
 `.accdb`) next to the source while it is connected. The file is deleted when acade2sql closes the
@@ -689,6 +960,30 @@ there. The copy is deleted at the end. You need free temp space equal to the siz
 If another program has locked the database, the run stops with
 `error: The database is locked by another program (close Access/AutoCAD Electrical, or use copy_to_temp): ...`.
 Close the program, or try again with `--copy-to-temp`.
+
+## Fix "the source database appears to be open in another program"
+
+```text
+WARNING acade2sql.readers.access_parser_reader the source database appears to be open in another program (lock file C:\...\fixture.laccdb exists): the pure reader reads the file as it is on disk, so a write in progress can make tables inconsistent. Close AutoCAD Electrical/Access first, or use --copy-to-temp (copy_to_temp=True).
+```
+
+The pure reader found `<name>.ldb` / `<name>.laccdb` next to the source, so another program
+(usually AutoCAD Electrical or Access) has the database open and may be writing to it. The run
+continues. What to do:
+
+1. Close the drawing project in AutoCAD Electrical (or close Access) and run again, or
+2. add `--copy-to-temp`. The source is copied first and the copy is read; the warning is not shown:
+
+   ```text
+   > acade2sql convert fixture.accdb --reader pure --copy-to-temp --tables NETS --target out/lk.sqlite
+   PASS NETS source=2 target=2
+   1 tables: 1 passed, 0 failed, 0 errors
+   ```
+
+If a write was in progress, the pure reader may find that a table's pages do not match its stored
+row count. That table then fails as `ERROR` (`SourceIntegrityError`) instead of being written
+partially; re-run it after closing the program. A lock file left behind by a crashed program
+causes the same warning; delete it only when you are sure no program has the database open.
 
 ## Query the result in SQLite
 
@@ -762,6 +1057,15 @@ PASS WIRENO source=3 target=3
   empty.
 - `FAIL` means the copy completed but the validation did not match: different counts,
   `checksum=MISMATCH`, or an unmapped Access type (`warnings=N`).
+- `read failed:` with the pure reader can also mean a field type it refuses (attachment,
+  multi-value, calculated, Date/Time Extended; re-run that table with `--reader odbc`) or
+  `SourceIntegrityError` (the file changed while being read, or is damaged; see
+  [Fix "the source database appears to be open in another program"](#fix-the-source-database-appears-to-be-open-in-another-program)).
+- `warnings=1` on a `PASS` line with the log line
+  `dates before 1753 are read using the ODBC driver's calendar and may differ from what Access displays table=OLDD`
+  means the table has dates before 1753-01-01. Both readers return them as the ODBC driver does,
+  which can be some days off from what Access shows (`#1700-06-15#` became `1700-06-02` in a test).
+  Check such values by hand if they matter.
 - Re-run with `-v` / `--verbose` to get timestamped debug logs and, for exit-1 errors, the traceback.
 
 ## Fix "keys that differ only by case/trailing spaces"

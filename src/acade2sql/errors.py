@@ -30,6 +30,17 @@ class BitnessMismatchError(DriverNotFoundError):
     """An Access driver exists, but only for the other bitness (32 vs 64-bit)."""
 
 
+class SourceIntegrityError(Acade2SqlError):
+    """The source file is internally inconsistent for one table (e.g. the pages scanned hold fewer
+    rows than the table definition records, or a page listed for the table belongs to another
+    one), so a complete read cannot be guaranteed. Never ignored: the table fails as a whole."""
+
+
+class UnsupportedAccessFeature(Acade2SqlError):
+    """The database or table uses a feature the chosen reader cannot read faithfully (e.g. an
+    attachment field with the pure reader, a Large Number (BIGINT) column with the ODBC driver)."""
+
+
 class TableNotFoundError(Acade2SqlError):
     """The requested table does not exist in the source database."""
 

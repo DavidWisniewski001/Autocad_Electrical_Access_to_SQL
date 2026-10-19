@@ -65,12 +65,59 @@ def mdb_db(tmp_path_factory) -> Path:
     return build_access.build(tmp_path_factory.mktemp("fx_cli") / "cli.mdb")
 
 
+READER_KINDS = ("odbc", "pure")
+
+
+@pytest.fixture(params=READER_KINDS)
+def reader_kind(request) -> str:
+    """The reader backend under test ('odbc' | 'pure')."""
+    return request.param
+
+
 @pytest.fixture
-def reader(access_db):
+def reader(access_db, reader_kind):
+    """A reader over the synthetic database, for both backends x both formats."""
     from acade2sql.readers import open_reader
 
-    with open_reader(access_db) as r:
+    with open_reader(access_db, reader=reader_kind) as r:
         yield r
+
+
+@pytest.fixture
+def odbc_reader(access_db):
+    from acade2sql.readers import open_reader
+
+    with open_reader(access_db, reader="odbc") as r:
+        yield r
+
+
+@pytest.fixture
+def pure_reader(access_db):
+    from acade2sql.readers import open_reader
+
+    with open_reader(access_db, reader="pure") as r:
+        yield r
+
+
+@pytest.fixture
+def no_odbc_driver(monkeypatch):
+    """Simulate a machine without the Access ODBC driver (``diagnose_driver`` reports not-ok).
+
+    Patched wherever the name may have been imported, so it works however the factory looks it up.
+    """
+    from acade2sql import diagnostics
+
+    def fake(drivers=None):
+        return diagnostics.DriverStatus(
+            False, diagnostics.python_bits(), [], "simulated: no Access ODBC driver"
+        )
+
+    monkeypatch.setattr(diagnostics, "diagnose_driver", fake)
+    for modname in ("acade2sql.readers", "acade2sql.cli", "acade2sql.converter"):
+        mod = __import__(modname, fromlist=["x"])
+        if hasattr(mod, "diagnose_driver"):
+            monkeypatch.setattr(mod, "diagnose_driver", fake)
+    return fake
 
 
 # ---- M4 fixtures ---------------------------------------------------------------------------------

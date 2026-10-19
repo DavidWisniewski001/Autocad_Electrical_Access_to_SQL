@@ -148,7 +148,8 @@ def test_missing_driver_gives_actionable_error(capsys, mdb_db, monkeypatch):
 
     monkeypatch.setattr(pyodbc, "drivers", lambda: [])
     monkeypatch.setattr(diagnostics, "_other_bitness_has_driver", lambda: False)
-    rc, _out, err = run(capsys, "inspect", str(mdb_db))
+    # M5: the default `auto` falls back to the pure reader; `--reader odbc` keeps the error
+    rc, _out, err = run(capsys, "inspect", str(mdb_db), "--reader", "odbc")
     assert rc == 1
     assert "Microsoft Access Database Engine" in err
     assert "-bit" in err

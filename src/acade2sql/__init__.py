@@ -7,9 +7,15 @@ from acade2sql.errors import (
     Acade2SqlError,
     BitnessMismatchError,
     DriverNotFoundError,
+    SchemaError,
+    SourceIntegrityError,
     SourceNotFoundError,
+    SyncKeyError,
     TableNotFoundError,
+    TargetDataError,
     TargetError,
+    UnsupportedAccessFeature,
+    UsageError,
     WriteError,
 )
 from acade2sql.readers import Reader, open_reader
@@ -17,7 +23,7 @@ from acade2sql.redact import mask_url, redact
 from acade2sql.schema import ColumnInfo, IndexInfo, TableInfo
 from acade2sql.validate import Report, TableResult
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Acade2SqlError",
@@ -27,11 +33,17 @@ __all__ = [
     "IndexInfo",
     "Reader",
     "Report",
+    "SchemaError",
+    "SourceIntegrityError",
     "SourceNotFoundError",
+    "SyncKeyError",
     "TableInfo",
     "TableNotFoundError",
     "TableResult",
+    "TargetDataError",
     "TargetError",
+    "UnsupportedAccessFeature",
+    "UsageError",
     "WriteError",
     "__version__",
     "convert",

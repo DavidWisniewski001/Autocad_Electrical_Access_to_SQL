@@ -126,7 +126,8 @@ def test_convert_missing_driver_actionable(capsys, mdb_db, tmp_path, monkeypatch
     monkeypatch.setattr(pyodbc, "drivers", lambda: [])
     monkeypatch.setattr(diagnostics, "_other_bitness_has_driver", lambda: False)
     out_db = tmp_path / "d.sqlite"
-    rc, _out, err = run(capsys, "convert", str(mdb_db), "--target", str(out_db))
+    # M5: the default `auto` falls back to the pure reader; `--reader odbc` keeps the error
+    rc, _out, err = run(capsys, "convert", str(mdb_db), "--target", str(out_db), "--reader", "odbc")
     assert rc == 1
     assert "Microsoft Access Database Engine" in err
     assert "Traceback" not in err
