@@ -1,0 +1,1 @@
+Source file integrity (recorded before the first connection and re-checked after the last; byte size + LastWriteTimeUtc ticks): `default_cat.mdb` 645,083,136 bytes (ticks 639279628906127599), `footprint_lookup.accdb` 42,143,744 bytes (ticks 639279628608366030) - **unchanged**; no `.ldb`/`.laccdb` file present in `data_files` afterwards.
