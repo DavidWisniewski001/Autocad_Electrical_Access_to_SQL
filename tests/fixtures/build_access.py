@@ -61,9 +61,7 @@ def create_empty_db(path: Path) -> None:
 def connect_rw(path: Path):
     import pyodbc
 
-    return pyodbc.connect(
-        f"Driver={{{DRIVER}}};Dbq={path};ExtendedAnsiSQL=1;", autocommit=True
-    )
+    return pyodbc.connect(f"Driver={{{DRIVER}}};Dbq={path};ExtendedAnsiSQL=1;", autocommit=True)
 
 
 def driver_available() -> bool:
@@ -83,7 +81,7 @@ SPECIAL_TEXT = [
     "  ABC  ",  # padded
     "µ · – Ω °",  # micro, middle dot, en dash, Omega, degree
     "日本語テキスト",  # CJK
-    "emoji \U0001F600 ok",  # non-BMP
+    "emoji \U0001f600 ok",  # non-BMP
     "line1\r\nline2",  # CR/LF
     "",  # empty string
     None,  # NULL
@@ -105,56 +103,136 @@ def _catalog_rows(prefix: str):
 
 TYPED_ROWS = [
     # L, S, B(byte), DBL, REAL, CUR, DT, YESNO, GUID, DEC, BIN, TXT
-    (1, -32768, 0, 1.5e300, 3.5, D("1234.5678"), dt.datetime(1900, 1, 1), True,
-     "{12345678-1234-1234-1234-123456789ABC}", D("12345678901234.1234"),
-     b"\x00\x01\xff", "µΩ°"),
-    (2, 32767, 255, -2.5e-300, -0.25, D("-922337203685477.5808"),
-     dt.datetime(2099, 12, 31, 23, 59, 59), False,
-     "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}", D("-0.0001"), b"\x00", ""),
-    (3, 0, 128, 0.0, 0.0, D("0"), dt.datetime(1899, 12, 30, 13, 45, 30), None,
-     None, D("0"), None, None),
+    (
+        1,
+        -32768,
+        0,
+        1.5e300,
+        3.5,
+        D("1234.5678"),
+        dt.datetime(1900, 1, 1),
+        True,
+        "{12345678-1234-1234-1234-123456789ABC}",
+        D("12345678901234.1234"),
+        b"\x00\x01\xff",
+        "µΩ°",
+    ),
+    (
+        2,
+        32767,
+        255,
+        -2.5e-300,
+        -0.25,
+        D("-922337203685477.5808"),
+        dt.datetime(2099, 12, 31, 23, 59, 59),
+        False,
+        "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}",
+        D("-0.0001"),
+        b"\x00",
+        "",
+    ),
+    (
+        3,
+        0,
+        128,
+        0.0,
+        0.0,
+        D("0"),
+        dt.datetime(1899, 12, 30, 13, 45, 30),
+        None,
+        None,
+        D("0"),
+        None,
+        None,
+    ),
     (2147483647, None, None, None, None, None, None, True, None, None, b"", " pad "),
 ]
 
 PROJECT_TABLES = {
     "COMP": dict(
         ddl="CREATE TABLE [COMP] (HDL TEXT(20) NOT NULL, TAGNAME TEXT(60), CAT TEXT(60), MFG TEXT(30), "
-            "DESC1 TEXT(60), DESC2 TEXT(60), DESC3 TEXT(60), LOC TEXT(30), INST TEXT(30), "
-            "SHEET TEXT(10), REF TEXT(10), CONSTRAINT PrimaryKey PRIMARY KEY (HDL))",
-        cols=["HDL", "TAGNAME", "CAT", "MFG", "DESC1", "DESC2", "DESC3", "LOC", "INST", "SHEET", "REF"],
-        rows=[(f"H{i:04d}", f"CR{i}", f"CAT-{i}", "AB", f"d1-{i}", None, "", "CAB1", "PNL", str(i), "A")
-              for i in range(1, 6)],
-        pk=("HDL",), src="discovered", counter=False),
+        "DESC1 TEXT(60), DESC2 TEXT(60), DESC3 TEXT(60), LOC TEXT(30), INST TEXT(30), "
+        "SHEET TEXT(10), REF TEXT(10), CONSTRAINT PrimaryKey PRIMARY KEY (HDL))",
+        cols=[
+            "HDL",
+            "TAGNAME",
+            "CAT",
+            "MFG",
+            "DESC1",
+            "DESC2",
+            "DESC3",
+            "LOC",
+            "INST",
+            "SHEET",
+            "REF",
+        ],
+        rows=[
+            (
+                f"H{i:04d}",
+                f"CR{i}",
+                f"CAT-{i}",
+                "AB",
+                f"d1-{i}",
+                None,
+                "",
+                "CAB1",
+                "PNL",
+                str(i),
+                "A",
+            )
+            for i in range(1, 6)
+        ],
+        pk=("HDL",),
+        src="discovered",
+        counter=False,
+    ),
     "PNLCOMP": dict(
         ddl="CREATE TABLE PNLCOMP (HDL TEXT(20), TAGNAME TEXT(60), CAT TEXT(60), PNLNAME TEXT(30), "
-            "X DOUBLE, Y DOUBLE)",
+        "X DOUBLE, Y DOUBLE)",
         cols=["HDL", "TAGNAME", "CAT", "PNLNAME", "X", "Y"],
-        rows=[("H0001", "CR1", "CAT-1", "PNL1", 10.5, 20.25),
-              ("H0002", None, "CAT-2", "PNL1", None, None),
-              ("H0001", "CR1", "CAT-1", "PNL1", 10.5, 20.25)],  # duplicate row; no key at all
-        pk=(), src="none", counter=False),
+        rows=[
+            ("H0001", "CR1", "CAT-1", "PNL1", 10.5, 20.25),
+            ("H0002", None, "CAT-2", "PNL1", None, None),
+            ("H0001", "CR1", "CAT-1", "PNL1", 10.5, 20.25),
+        ],  # duplicate row; no key at all
+        pk=(),
+        src="none",
+        counter=False,
+    ),
     "TERMS": dict(
         ddl="CREATE TABLE TERMS (HDL TEXT(20) NOT NULL, TERM TEXT(10) NOT NULL, WIRENO TEXT(30), "
-            "PIN TEXT(10), CONSTRAINT PrimaryKey PRIMARY KEY (HDL, TERM))",
+        "PIN TEXT(10), CONSTRAINT PrimaryKey PRIMARY KEY (HDL, TERM))",
         cols=["HDL", "TERM", "WIRENO", "PIN"],
         rows=[("H0001", "1", "W1", "A1"), ("H0001", "2", "W2", None), ("H0002", "1", "", "A2")],
-        pk=("HDL", "TERM"), src="discovered", counter=False),
+        pk=("HDL", "TERM"),
+        src="discovered",
+        counter=False,
+    ),
     "WIRENO": dict(
         ddl="CREATE TABLE WIRENO (RECNUM COUNTER, WIRENO TEXT(30), SHEET TEXT(10), COLOR TEXT(20))",
         cols=["WIRENO", "SHEET", "COLOR"],
         rows=[("W1", "1", "RED"), ("W2", "1", None), ("W3", "2", "BLU")],
-        pk=("RECNUM",), src="inferred", counter=True),
+        pk=("RECNUM",),
+        src="inferred",
+        counter=True,
+    ),
     "WFRM2ALL": dict(
         ddl="CREATE TABLE WFRM2ALL (RECNUM COUNTER, WIRENO TEXT(30), NAM1 TEXT(30), PIN1 TEXT(10), "
-            "NAM2 TEXT(30), PIN2 TEXT(10), LEN DOUBLE)",
+        "NAM2 TEXT(30), PIN2 TEXT(10), LEN DOUBLE)",
         cols=["WIRENO", "NAM1", "PIN1", "NAM2", "PIN2", "LEN"],
         rows=[("W1", "CR1", "A1", "CR2", "A2", 1.25), ("W2", "CR1", "A2", None, None, None)],
-        pk=("RECNUM",), src="inferred", counter=True),
+        pk=("RECNUM",),
+        src="inferred",
+        counter=True,
+    ),
     "NETS": dict(
         ddl="CREATE TABLE NETS (RECNUM COUNTER, NETNAME TEXT(30), SHEET TEXT(10))",
         cols=["NETNAME", "SHEET"],
         rows=[("N1", "1"), ("N2", "2")],
-        pk=("RECNUM",), src="inferred", counter=True),
+        pk=("RECNUM",),
+        src="inferred",
+        counter=True,
+    ),
 }
 
 HOSTILE = {
@@ -201,8 +279,13 @@ def build_manifest() -> dict:
     m: dict[str, dict] = {}
     for name, spec in PROJECT_TABLES.items():
         cols = (["RECNUM"] if spec["counter"] else []) + spec["cols"]
-        m[name] = dict(count=len(spec["rows"]), pk=spec["pk"], pk_source=spec["src"],
-                       columns=cols, rows=_expected_with_counter(spec))
+        m[name] = dict(
+            count=len(spec["rows"]),
+            pk=spec["pk"],
+            pk_source=spec["src"],
+            columns=cols,
+            rows=_expected_with_counter(spec),
+        )
     for fam in ("XX", "_PINLIST_XX"):
         rows = _catalog_rows("P" if fam == "XX" else "Q")
         if fam == "XX":
@@ -211,25 +294,50 @@ def build_manifest() -> dict:
         else:
             exp = [(i,) + tuple(r) for i, r in enumerate(rows, 1)]
             cols = ["RECNUM", "CATALOG", "ASSEMBLYCODE", "MFG", "DESC1", "NOTES"]
-        m[fam] = dict(count=len(rows), pk=("RECNUM",), pk_source="inferred", columns=cols,
-                      rows=exp, index=("CATALOG", "ASSEMBLYCODE"))
-    m["EMPTYFAM"] = dict(count=0, pk=("RECNUM",), pk_source="inferred",
-                         columns=["CATALOG", "RECNUM"], rows=[])
+        m[fam] = dict(
+            count=len(rows),
+            pk=("RECNUM",),
+            pk_source="inferred",
+            columns=cols,
+            rows=exp,
+            index=("CATALOG", "ASSEMBLYCODE"),
+        )
+    m["EMPTYFAM"] = dict(
+        count=0, pk=("RECNUM",), pk_source="inferred", columns=["CATALOG", "RECNUM"], rows=[]
+    )
     for name, cols in HOSTILE.items():
         rows = [(i,) + tuple(r) for i, r in enumerate(_hostile_rows(cols), 1)]
-        m[name] = dict(count=2, pk=("RECNUM",), pk_source="inferred",
-                       columns=["RECNUM"] + cols, rows=rows)
+        m[name] = dict(
+            count=2, pk=("RECNUM",), pk_source="inferred", columns=["RECNUM"] + cols, rows=rows
+        )
     m["TYPED"] = dict(
-        count=len(TYPED_ROWS), pk=("ID",), pk_source="discovered",
+        count=len(TYPED_ROWS),
+        pk=("ID",),
+        pk_source="discovered",
         columns=["ID", "L", "S", "B", "DBL", "RL", "CUR", "DT", "YN", "G", "DEC", "BIN", "TXT"],
         rows=[(i,) + _as_read(r) for i, r in enumerate(TYPED_ROWS, 1)],
-        access_types={"ID": "COUNTER", "L": "INTEGER", "S": "SMALLINT", "B": "BYTE",
-                      "DBL": "DOUBLE", "RL": "REAL", "CUR": "CURRENCY", "DT": "DATETIME",
-                      "YN": "BIT", "G": "GUID", "DEC": "DECIMAL", "BIN": "LONGBINARY",
-                      "TXT": "VARCHAR"},
+        access_types={
+            "ID": "COUNTER",
+            "L": "INTEGER",
+            "S": "SMALLINT",
+            "B": "BYTE",
+            "DBL": "DOUBLE",
+            "RL": "REAL",
+            "CUR": "CURRENCY",
+            "DT": "DATETIME",
+            "YN": "BIT",
+            "G": "GUID",
+            "DEC": "DECIMAL",
+            "BIN": "LONGBINARY",
+            "TXT": "VARCHAR",
+        },
     )
-    m["BIG"] = dict(count=BIG_ROWS, pk=("RECNUM",), pk_source="inferred",
-                    columns=["RECNUM", "KEY1", "VAL", "TXT"])
+    m["BIG"] = dict(
+        count=BIG_ROWS,
+        pk=("RECNUM",),
+        pk_source="inferred",
+        columns=["RECNUM", "KEY1", "VAL", "TXT"],
+    )
     return m
 
 
@@ -250,20 +358,30 @@ def build(path: Path) -> Path:
     cur = con.cursor()
     try:
         # (a) catalog-like
-        cur.execute("CREATE TABLE XX ([CATALOG] TEXT(60), ASSEMBLYCODE TEXT(30), MFG TEXT(255), "
-                    "DESC1 TEXT(255), NOTES MEMO, RECNUM COUNTER)")
+        cur.execute(
+            "CREATE TABLE XX ([CATALOG] TEXT(60), ASSEMBLYCODE TEXT(30), MFG TEXT(255), "
+            "DESC1 TEXT(255), NOTES MEMO, RECNUM COUNTER)"
+        )
         cur.execute("CREATE INDEX IDX_CAT ON XX ([CATALOG], ASSEMBLYCODE)")
         _insert(cur, "XX", ["CATALOG", "ASSEMBLYCODE", "MFG", "DESC1", "NOTES"], _catalog_rows("P"))
-        cur.execute("CREATE TABLE [_PINLIST_XX] (RECNUM COUNTER, [CATALOG] TEXT(60), ASSEMBLYCODE TEXT(30), "
-                    "MFG TEXT(255), DESC1 TEXT(255), NOTES MEMO)")
+        cur.execute(
+            "CREATE TABLE [_PINLIST_XX] (RECNUM COUNTER, [CATALOG] TEXT(60), ASSEMBLYCODE TEXT(30), "
+            "MFG TEXT(255), DESC1 TEXT(255), NOTES MEMO)"
+        )
         cur.execute("CREATE INDEX IDX_CAT ON [_PINLIST_XX] ([CATALOG], ASSEMBLYCODE)")
-        _insert(cur, "_PINLIST_XX", ["CATALOG", "ASSEMBLYCODE", "MFG", "DESC1", "NOTES"],
-                _catalog_rows("Q"))
+        _insert(
+            cur,
+            "_PINLIST_XX",
+            ["CATALOG", "ASSEMBLYCODE", "MFG", "DESC1", "NOTES"],
+            _catalog_rows("Q"),
+        )
         cur.execute("CREATE TABLE EMPTYFAM ([CATALOG] TEXT(30), RECNUM COUNTER)")
 
         # (b) hostile names
-        cur.execute("CREATE TABLE [ALLEN BRADLEY] (RECNUM COUNTER, [DESC] TEXT(20), [RANGE] TEXT(20), "
-                    "[DUCT SIZE W x H] TEXT(20), [COIL/VOLTAGE/STYLE] TEXT(20))")
+        cur.execute(
+            "CREATE TABLE [ALLEN BRADLEY] (RECNUM COUNTER, [DESC] TEXT(20), [RANGE] TEXT(20), "
+            "[DUCT SIZE W x H] TEXT(20), [COIL/VOLTAGE/STYLE] TEXT(20))"
+        )
         for name in ("ALLEN-BRADLEY", "KRAUS & NAIMER", "DO"):
             cur.execute(f"CREATE TABLE [{name}] (RECNUM COUNTER, [CATALOG] TEXT(20))")
         cur.execute("CREATE TABLE [_PINLIST_BRUNDY/HUBBEL] (RECNUM COUNTER, PIN TEXT(20))")
@@ -276,11 +394,17 @@ def build(path: Path) -> Path:
             _insert(cur, name, spec["cols"], spec["rows"])
 
         # (d) typed
-        cur.execute("CREATE TABLE TYPED (ID COUNTER, L LONG, S SMALLINT, B BYTE, DBL DOUBLE, RL REAL, "
-                    "CUR CURRENCY, DT DATETIME, YN YESNO, G GUID, [DEC] DECIMAL(18,4), BIN LONGBINARY, "
-                    "TXT TEXT(20), CONSTRAINT PrimaryKey PRIMARY KEY (ID))")
-        _insert(cur, "TYPED",
-                ["L", "S", "B", "DBL", "RL", "CUR", "DT", "YN", "G", "DEC", "BIN", "TXT"], TYPED_ROWS)
+        cur.execute(
+            "CREATE TABLE TYPED (ID COUNTER, L LONG, S SMALLINT, B BYTE, DBL DOUBLE, RL REAL, "
+            "CUR CURRENCY, DT DATETIME, YN YESNO, G GUID, [DEC] DECIMAL(18,4), BIN LONGBINARY, "
+            "TXT TEXT(20), CONSTRAINT PrimaryKey PRIMARY KEY (ID))"
+        )
+        _insert(
+            cur,
+            "TYPED",
+            ["L", "S", "B", "DBL", "RL", "CUR", "DT", "YN", "G", "DEC", "BIN", "TXT"],
+            TYPED_ROWS,
+        )
 
         # (e) big
         cur.execute("CREATE TABLE BIG (RECNUM COUNTER, KEY1 TEXT(20), VAL LONG, TXT TEXT(30))")

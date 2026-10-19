@@ -6,6 +6,13 @@ print a clean, actionable message instead of a traceback.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from acade2sql.redact import redact
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import URL
+
 
 class Acade2SqlError(Exception):
     """Base class for all expected acade2sql failures."""
@@ -25,3 +32,23 @@ class BitnessMismatchError(DriverNotFoundError):
 
 class TableNotFoundError(Acade2SqlError):
     """The requested table does not exist in the source database."""
+
+
+class TargetError(Acade2SqlError):
+    """The target URL is invalid, or its database driver is not installed."""
+
+
+class WriteError(Acade2SqlError):
+    """Writing one table to the target failed; the table's transaction was rolled back."""
+
+    MAX_CAUSE_CHARS = 500
+
+    def __init__(self, table: str, cause: BaseException, *, url: str | URL | None = None) -> None:
+        """``url``: the target URL whose secrets are redacted from the message."""
+        self.table = table
+        self.cause = cause
+        text = redact(str(getattr(cause, "orig", None) or cause), url)
+        if len(text) > self.MAX_CAUSE_CHARS:
+            text = text[: self.MAX_CAUSE_CHARS] + "..."
+        self.detail = f"{type(cause).__name__}: {text}"
+        super().__init__(f"Writing table {table!r} failed: {self.detail}")

@@ -27,6 +27,7 @@ def _all_rows(reader, name, batch_size=5000):
 
 # ---------------------------------------------------------------- list_tables
 
+
 def test_list_tables_exact_and_sorted(reader):
     names = reader.list_tables()
     assert names == sorted(names, key=str.casefold)
@@ -51,9 +52,16 @@ def test_system_tables_not_resolvable(reader):
         reader.count_rows("msysobjects")
 
 
-@pytest.mark.parametrize("name", [
-    "ALLEN BRADLEY", "ALLEN-BRADLEY", "_PINLIST_BRUNDY/HUBBEL", "KRAUS & NAIMER", "DO",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ALLEN BRADLEY",
+        "ALLEN-BRADLEY",
+        "_PINLIST_BRUNDY/HUBBEL",
+        "KRAUS & NAIMER",
+        "DO",
+    ],
+)
 def test_hostile_table_names_present(reader, name):
     assert name in reader.list_tables()
     info = reader.get_table(name)
@@ -74,6 +82,7 @@ def test_hostile_table_rows(reader):
 
 
 # ------------------------------------------------------------------ get_table
+
 
 def test_get_table_returns_tableinfo(reader):
     info = reader.get_table("COMP")
@@ -195,6 +204,7 @@ def test_unknown_table(reader):
 
 # ---------------------------------------------------------------- count / iter
 
+
 @pytest.mark.parametrize("name", sorted(MANIFEST))
 def test_count_rows(reader, name):
     assert reader.count_rows(name) == MANIFEST[name]["count"]
@@ -244,9 +254,19 @@ def test_iter_rows_bad_batch_size(reader, bad):
         list(reader.iter_rows("COMP", batch_size=bad))
 
 
-@pytest.mark.parametrize("name", [
-    "COMP", "PNLCOMP", "TERMS", "WIRENO", "WFRM2ALL", "NETS", "XX", "_PINLIST_XX",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "COMP",
+        "PNLCOMP",
+        "TERMS",
+        "WIRENO",
+        "WFRM2ALL",
+        "NETS",
+        "XX",
+        "_PINLIST_XX",
+    ],
+)
 def test_manifest_rows_exact(reader, name):
     assert _all_rows(reader, name) == MANIFEST[name]["rows"]
 
@@ -258,6 +278,7 @@ def test_row_column_order_follows_ordinal(reader):
 
 
 # --------------------------------------------------------------- value contract
+
 
 def _xx(reader):
     return {r[0]: r for r in _all_rows(reader, "XX")}
@@ -282,7 +303,7 @@ def test_unicode_preserved(reader):
     r = _xx(reader)
     assert r["P-001"][2] == "µ · – Ω °"
     assert r["P-002"][2] == "日本語テキスト"
-    assert r["P-003"][2] == "emoji \U0001F600 ok"
+    assert r["P-003"][2] == "emoji \U0001f600 ok"
     assert _all_rows(reader, "TYPED")[0][-1] == "µΩ°"
 
 
@@ -361,6 +382,7 @@ def test_guid_value(reader):
 
 
 # -------------------------------------------------------------- source handling
+
 
 def test_missing_file(tmp_path):
     with pytest.raises(SourceNotFoundError):

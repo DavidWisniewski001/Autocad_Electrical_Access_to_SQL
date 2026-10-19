@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import re
+import sqlite3
+import time
+
 import pytest
 from tests.conftest import DEFAULT_CAT, FOOTPRINT
 
+from acade2sql import convert
 from acade2sql.readers import open_reader
 
 pytestmark = [pytest.mark.real_data, pytest.mark.requires_driver]
@@ -87,3 +93,79 @@ def test_footprint_small_table_roundtrip_counts():
     with open_reader(FOOTPRINT) as r:
         for n in r.list_tables()[:5]:
             assert sum(len(b) for b in r.iter_rows(n, batch_size=333)) == r.count_rows(n)
+
+
+# ---- M3: full conversions (read-only sources; SQLite outputs in pytest tmp dirs) ----------------
+
+CONVERT_TIMINGS: dict[str, float] = {}
+
+
+@pytest.fixture(scope="module")
+def footprint_conversion(tmp_path_factory):
+    d = tmp_path_factory.mktemp("fp")
+    t0 = time.perf_counter()
+    rep = convert(
+        FOOTPRINT,
+        "sqlite:///" + (d / "fp.sqlite").as_posix(),
+        checksum=True,
+        report_path=d / "fp.json",
+    )
+    CONVERT_TIMINGS["footprint_lookup (checksum)"] = time.perf_counter() - t0
+    return rep, d
+
+
+@pytest.fixture(scope="module")
+def catalog_conversion(tmp_path_factory):
+    d = tmp_path_factory.mktemp("cat")
+    t0 = time.perf_counter()
+    rep = convert(DEFAULT_CAT, "sqlite:///" + (d / "cat.sqlite").as_posix())
+    CONVERT_TIMINGS["default_cat"] = time.perf_counter() - t0
+    return rep, d
+
+
+@pytest.mark.slow
+def test_convert_footprint_lookup(footprint_conversion):
+    rep, d = footprint_conversion
+    assert rep.ok, rep.render_text()
+    assert len(rep.tables) == 117
+    assert all(t.status == "pass" and t.checksum_match is True for t in rep.tables)
+    assert sum(t.target_rows for t in rep.tables) == 261_858
+    assert sum(t.source_rows for t in rep.tables) == 261_858
+    doc = json.loads((d / "fp.json").read_text(encoding="utf-8"))
+    assert len(doc["tables"]) == 117
+    assert rep.render_text().splitlines()[-1] == "117 tables: 117 passed, 0 failed, 0 errors"
+
+
+@pytest.mark.slow
+def test_convert_default_cat(catalog_conversion):
+    rep, d = catalog_conversion
+    assert rep.ok, rep.render_text()
+    assert len(rep.tables) == 168
+    assert all(t.status == "pass" for t in rep.tables)
+    assert sum(t.target_rows for t in rep.tables) == 1_594_493
+    assert rep.render_text().splitlines()[-1] == "168 tables: 168 passed, 0 failed, 0 errors"
+    con = sqlite3.connect(d / "cat.sqlite")
+    try:
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert len(names) == 168
+        hostile = {n for n in names if re.search(r"[^A-Za-z0-9_]", n)}
+        assert hostile, "expected at least one table with a space/punctuation in its name"
+        for n in hostile:
+            q = n.replace('"', '""')
+            src_rows = next(t.source_rows for t in rep.tables if t.name == n)
+            assert con.execute(f'SELECT COUNT(*) FROM "{q}"').fetchone()[0] == src_rows
+        ix = [
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+            )
+        ]
+        assert len(ix) == len(set(ix))
+    finally:
+        con.close()
+
+
+@pytest.mark.slow
+def test_convert_timings_report(footprint_conversion, catalog_conversion):
+    print("\nREAL-DATA CONVERT TIMINGS:", {k: round(v, 1) for k, v in CONVERT_TIMINGS.items()})
+    assert CONVERT_TIMINGS["default_cat"] < 300  # spec section 6.3: < 5 min

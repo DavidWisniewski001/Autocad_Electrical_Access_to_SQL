@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from typing import TextIO
 
 _HANDLER_NAME = "acade2sql-stderr"
 
@@ -37,14 +38,39 @@ def _fmt(value: object) -> str:
     return text
 
 
+class CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """StreamHandler that always writes to the *current* ``sys.stderr`` (looked up at emit time),
+    so redirected or captured stderr (pytest capsys, contextlib.redirect_stderr) is honoured."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @property  # type: ignore[override]
+    def stream(self) -> TextIO:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value: object) -> None:  # StreamHandler.__init__/setStream assign it
+        pass
+
+
 def configure_logging(verbose: bool) -> None:
-    """Install a single stderr handler on the ``acade2sql`` logger (idempotent)."""
+    """Route the ``acade2sql`` logger to stderr. Idempotent: never stacks handlers.
+
+    Sets the level (DEBUG if ``verbose`` else WARNING) and ``propagate=False`` so records are not
+    duplicated by root handlers. Without this call the package adds no handler of its own.
+    """
     logger = logging.getLogger("acade2sql")
     logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
-    for handler in list(logger.handlers):
-        if handler.get_name() == _HANDLER_NAME:
-            logger.removeHandler(handler)
-    handler = logging.StreamHandler(sys.stderr)
+    logger.propagate = False
+    ours = [h for h in logger.handlers if h.get_name() == _HANDLER_NAME]
+    for extra in ours[1:]:
+        logger.removeHandler(extra)
+    if ours and isinstance(ours[0], CurrentStderrHandler):
+        return
+    if ours:
+        logger.removeHandler(ours[0])
+    handler = CurrentStderrHandler()
     handler.set_name(_HANDLER_NAME)
     handler.setFormatter(KeyValueFormatter())
     logger.addHandler(handler)

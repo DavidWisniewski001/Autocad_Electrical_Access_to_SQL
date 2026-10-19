@@ -1,4 +1,4 @@
-"""Command-line interface: ``acade2sql inspect`` and (from M3) ``acade2sql convert``."""
+"""Command-line interface: ``acade2sql inspect`` and ``acade2sql convert``."""
 
 from __future__ import annotations
 
@@ -6,18 +6,21 @@ import argparse
 import json
 import logging
 import sys
+import time
 from collections.abc import Sequence
 from typing import Any, TextIO
 
 from acade2sql import __version__
+from acade2sql.converter import TARGET_ENV, convert
 from acade2sql.errors import Acade2SqlError
 from acade2sql.logging_setup import configure_logging
 from acade2sql.readers import Reader, open_reader
+from acade2sql.redact import redact
 from acade2sql.schema import TableInfo
 
 log = logging.getLogger("acade2sql.cli")
 
-EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_VALIDATION = 0, 1, 2, 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -61,9 +64,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="count rows per table (default: on)",
     )
 
-    conv = sub.add_parser("convert", parents=[common], help="convert to SQL (milestone M3)")
-    conv.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    conv = sub.add_parser("convert", parents=[common], help="convert to a SQL database")
+    conv.add_argument("source", help="Access database (.mdb or .accdb)")
+    conv.add_argument(
+        "--target",
+        metavar="URL|PATH",
+        help=f"SQLAlchemy URL or .sqlite/.db path (default: ${TARGET_ENV}, else ./<source>.sqlite)",
+    )
+    conv.add_argument("--mode", choices=["full"], default="full", help="write mode (default: full)")
+    conv.add_argument("--tables", nargs="+", metavar="T", help="only these tables")
+    conv.add_argument("--exclude", nargs="+", metavar="T", help="skip these tables")
+    conv.add_argument(
+        "--batch-size", type=_positive_int, default=5000, metavar="N", help="rows per batch"
+    )
+    conv.add_argument(
+        "--checksum", action="store_true", help="compare row checksums (re-reads every table)"
+    )
+    conv.add_argument(
+        "--copy-to-temp", action="store_true", help="read from a temporary copy of the source"
+    )
+    conv.add_argument("--report", metavar="PATH.json", help="write the JSON report here")
     return parser
+
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1: {value}")
+    return value
 
 
 def _table_row(info: TableInfo, rows: int | None) -> dict[str, Any]:
@@ -134,13 +165,33 @@ def _cmd_inspect(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _cmd_convert(args: argparse.Namespace) -> int:
-    sys.stderr.write("convert is not implemented yet (milestone M3)\n")
-    return EXIT_USAGE
+def _cmd_convert(args: argparse.Namespace, out: TextIO) -> int:
+    started = time.perf_counter()
+    report = convert(
+        args.source,
+        args.target,
+        mode=args.mode,
+        tables=args.tables,
+        exclude=args.exclude,
+        batch_size=args.batch_size,
+        checksum=args.checksum,
+        copy_to_temp=args.copy_to_temp,
+        report_path=args.report,
+    )
+    elapsed = time.perf_counter() - started
+    if not report.tables:
+        sys.stderr.write("warning: no tables selected\n")
+    out.write(report.render_text() + "\n")
+    rows = sum(t.target_rows or 0 for t in report.tables)
+    rate = round(rows / elapsed) if elapsed > 0 else rows
+    sys.stderr.write(
+        f"target={report.target} rows={rows} elapsed={elapsed:.1f}s rows_per_s={rate}\n"
+    )
+    return EXIT_OK if report.ok else EXIT_VALIDATION
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point. Returns 0 on success, 1 on an acade2sql error, 2 on usage errors."""
+    """Entry point. Exit codes: 0 success, 1 acade2sql error, 2 usage, 3 validation failure."""
     parser = _build_parser()
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
@@ -151,11 +202,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "inspect":
             return _cmd_inspect(args, sys.stdout)
-        return _cmd_convert(args)
+        return _cmd_convert(args, sys.stdout)
     except Acade2SqlError as exc:
+        target = getattr(args, "target", None)
         if verbose:
-            log.exception("failed")
-        sys.stderr.write(f"error: {exc}\n")
+            log.error("failed", exc_info=True)  # target errors are raised "from None": no secrets
+        sys.stderr.write(f"error: {redact(str(exc), target)}\n")
         return EXIT_ERROR
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")

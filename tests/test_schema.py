@@ -10,8 +10,12 @@ from acade2sql.schema import ColumnInfo, IndexInfo, TableInfo
 
 def _col(name, ordinal=1, **kw):
     base = dict(
-        access_type="VARCHAR", data_type=12, size=10, decimal_digits=None,
-        nullable=True, autoincrement=False,
+        access_type="VARCHAR",
+        data_type=12,
+        size=10,
+        decimal_digits=None,
+        nullable=True,
+        autoincrement=False,
     )
     base.update(kw)
     return ColumnInfo(name=name, ordinal=ordinal, **base)
@@ -21,8 +25,11 @@ def _col(name, ordinal=1, **kw):
 def table():
     return TableInfo(
         name="T",
-        columns=(_col("RECNUM", 1, access_type="COUNTER", autoincrement=True, nullable=False),
-                 _col("Cat", 2), _col("DESC", 3)),
+        columns=(
+            _col("RECNUM", 1, access_type="COUNTER", autoincrement=True, nullable=False),
+            _col("Cat", 2),
+            _col("DESC", 3),
+        ),
         primary_key=("RECNUM",),
         primary_key_source="inferred",
         indexes=(IndexInfo("i1", ("Cat", "DESC"), False),),

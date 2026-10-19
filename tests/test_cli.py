@@ -96,22 +96,6 @@ def test_inspect_json_no_counts(capsys, mdb_db):
     json.loads(out)
 
 
-def test_convert_not_implemented(capsys, mdb_db, tmp_path):
-    rc, out, err = run(capsys, "convert", str(mdb_db), str(tmp_path / "o.sqlite"))
-    assert rc == 2
-    assert "not implemented yet" in (out + err)
-    assert not (tmp_path / "o.sqlite").exists()
-
-
-def test_convert_bare_not_implemented(capsys, mdb_db):
-    try:
-        rc, _out, _err = run(capsys, "convert", str(mdb_db))
-    except SystemExit as e:  # argparse usage error is also exit 2
-        assert e.code == 2
-    else:
-        assert rc == 2
-
-
 def test_missing_file(capsys, tmp_path):
     rc, out, err = run(capsys, "inspect", str(tmp_path / "missing.mdb"))
     assert rc == 1

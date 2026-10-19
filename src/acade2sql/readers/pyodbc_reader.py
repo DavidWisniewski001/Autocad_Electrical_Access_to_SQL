@@ -6,6 +6,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -18,12 +19,18 @@ from acade2sql.errors import Acade2SqlError, SourceNotFoundError, TableNotFoundE
 from acade2sql.readers.base import Reader
 from acade2sql.schema import ColumnInfo, IndexInfo, PrimaryKeySource, TableInfo
 
+# Requirement 10: no ODBC connection pooling, so closing the reader really releases the Access file
+# (and its .ldb lock). Set at import time, before the first pyodbc.connect() in the process.
+pyodbc.pooling = False
+
 log = logging.getLogger(__name__)
 
 ACCESS_SUFFIXES = frozenset({".mdb", ".accdb"})
 PRIMARY_KEY_INDEX = "primarykey"
 _BINARY_TYPES = frozenset({"LONGBINARY", "BINARY", "VARBINARY"})
 _SQL_NULLABLE = 1
+_CLEANUP_RETRIES = 10
+_CLEANUP_DELAY_S = 0.2
 
 
 def quote_access(name: str) -> str:
@@ -69,7 +76,7 @@ class PyodbcReader(Reader):
     # -- lifecycle -----------------------------------------------------------------------------
 
     def _copy_to_temp(self, source: Path) -> Path:
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="acade2sql-")
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="acade2sql_", ignore_cleanup_errors=True)
         target = Path(self._tmpdir.name) / source.name
         shutil.copy2(source, target)
         log.debug("copied source to temp", extra={"kv": {"temp": str(target)}})
@@ -93,8 +100,22 @@ class PyodbcReader(Reader):
                 log.debug("error while closing connection", exc_info=True)
             self._conn = None
         if self._tmpdir is not None:
-            self._tmpdir.cleanup()
+            tmp = Path(self._tmpdir.name)
+            copies = list(tmp.iterdir()) if tmp.is_dir() else []
+            self._tmpdir.cleanup()  # ignore_cleanup_errors=True: never raises
             self._tmpdir = None
+            # The Access driver can hold the copied file for a moment after close; retry briefly.
+            for _ in range(_CLEANUP_RETRIES):
+                if not tmp.exists():
+                    break
+                time.sleep(_CLEANUP_DELAY_S)
+                shutil.rmtree(tmp, ignore_errors=True)
+            leftover = [p for p in copies if p.exists()]
+            if leftover:
+                log.warning(
+                    "temporary copy of the source could not be removed",
+                    extra={"kv": {"path": str(leftover[0])}},
+                )
 
     def _cursor(self) -> pyodbc.Cursor:
         if self._conn is None:

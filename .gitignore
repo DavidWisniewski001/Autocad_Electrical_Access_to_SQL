@@ -24,3 +24,6 @@ htmlcov/
 # Converter outputs
 *.sqlite
 *.sqlite3
+
+# Claude Code worktrees
+.claude/worktrees/
