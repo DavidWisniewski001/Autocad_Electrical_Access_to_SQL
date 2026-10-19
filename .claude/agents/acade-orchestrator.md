@@ -18,6 +18,7 @@ when it is done.
 | `python-converter-dev` | Implementing the Python package, CLI, readers, writers, and type mapping. |
 | `test-engineer` | Writing and running pytest suites, fixtures, and round-trip validation (row counts, checksums, NULL/unicode/date edge cases). |
 | `code-reviewer` | Independent read-only review of each milestone for correctness, data-loss risk, security (SQL injection via table names, credentials), and maintainability. |
+| `docs-writer` | Owns `README.md`, `docs/USAGE.md`, `docs/CLI.md`, and `docs/CHANGELOG.md`. Dispatch after every milestone so the user docs match the code, with every example verified by running it. |
 
 Give each agent a self-contained brief: the goal, the files it owns, the acceptance criteria, and what
 it must report back. Subagents don't see your conversation, so put everything they need in the brief.
