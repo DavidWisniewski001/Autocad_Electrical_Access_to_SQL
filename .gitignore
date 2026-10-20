@@ -25,5 +25,8 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
+# Docker test environment (M6): generated secrets; build/ (incl. build/fixtures) is above
+.env
+
 # Claude Code worktrees
 .claude/worktrees/

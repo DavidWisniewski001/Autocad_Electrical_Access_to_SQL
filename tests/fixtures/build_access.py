@@ -15,11 +15,10 @@ Findings (driver quirks):
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import datetime as dt
 import decimal
 import os
-from ctypes import wintypes
+import sys
 from pathlib import Path
 
 DRIVER = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -34,6 +33,12 @@ class FixtureError(RuntimeError):
 
 
 def create_empty_db(path: Path) -> None:
+    """Create an empty Access file (Windows only: the ctypes imports are deliberately lazy)."""
+    if sys.platform != "win32":
+        raise FixtureError("building Access fixtures needs Windows and the Access ODBC driver")
+    import ctypes
+    from ctypes import wintypes
+
     path = Path(path)
     ext = path.suffix.lower()
     keyword = "CREATE_DBV12" if ext == ".accdb" else "CREATE_DB"
@@ -65,6 +70,8 @@ def connect_rw(path: Path):
 
 
 def driver_available() -> bool:
+    if sys.platform != "win32":
+        return False
     try:
         import pyodbc
     except ImportError:
@@ -515,3 +522,36 @@ def build(path: Path) -> Path:
             with contextlib.suppress(OSError):
                 os.remove(p)
     return path
+
+
+def manifest_json(formats: tuple[str, ...] = ("mdb", "accdb")) -> dict:
+    """JSON-serialisable summary of ``MANIFEST`` for the live tests (MANIFEST.json).
+
+    ``tamper`` names what ``tests/test_live_db.py`` modifies on the target side: one keyed text
+    table (update one value, delete one row, add one extra row) and the key used for the
+    collation-guard scenario.
+    """
+    tables = {
+        name: {
+            "count": spec["count"],
+            "pk": list(spec["pk"]),
+            "pk_source": spec["pk_source"],
+            "columns": list(spec["columns"]),
+        }
+        for name, spec in MANIFEST.items()
+    }
+    return {
+        "format": 1,
+        "files": [f"fixture.{ext}" for ext in formats],
+        "tables": tables,
+        "tamper": {
+            "table": "COMP",
+            "key": "HDL",
+            "update_column": "TAGNAME",
+            "update_key": "H0002",
+            "delete_key": "H0005",
+            "extra_key": "EXTRA1",
+            "case_key": "H0001",
+            "real_table": "TYPED",
+        },
+    }

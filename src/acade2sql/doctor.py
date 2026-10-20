@@ -52,6 +52,14 @@ def _access_reader_checks() -> list[Check]:
     except Exception as exc:
         return [Check("odbc reader", False, f"driver check failed: {type(exc).__name__}: {exc}")]
     drivers = ", ".join(status.access_drivers) or "none found"
+    if sys.platform != "win32":
+        # No registry, no 32/64-bit redistributable: the driver simply does not exist here.
+        if not status.access_drivers:
+            drivers += " (the Access ODBC driver is Windows-only; the pure reader is used)"
+        return [
+            Check("Access ODBC drivers", bool(status.access_drivers), drivers),
+            Check("odbc reader", status.ok, status.message),
+        ]
     checks = [Check("Access ODBC drivers", bool(status.access_drivers), drivers)]
     other = getattr(status, "other_bitness_driver", False) or _other_bitness_driver()
     other_bits = 32 if getattr(status, "python_bits", 64) == 64 else 64

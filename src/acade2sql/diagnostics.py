@@ -46,6 +46,14 @@ def python_bits() -> int:
 
 
 def _redist_hint(bits: int) -> str:
+    if sys.platform != "win32":
+        # The redistributable is a Windows installer: point Linux/macOS (e.g. the Docker test
+        # runner) at the pure-Python reader instead of an installer they cannot run.
+        return (
+            "The Microsoft Access Database Engine and its ODBC driver are Windows-only; on this "
+            f"platform ({sys.platform}) use the pure-Python reader (--reader pure, which "
+            "--reader auto selects automatically)."
+        )
     arch = "x64" if bits == 64 else "x86"
     exe = "accessdatabaseengine_X64.exe" if bits == 64 else "accessdatabaseengine.exe"
     return (

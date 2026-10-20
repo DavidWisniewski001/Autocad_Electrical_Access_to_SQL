@@ -1,0 +1,29 @@
+# Build context for docker/Dockerfile (the test-runner image). Keep secrets, customer
+# databases and local artefacts out of the image: data_files/ and build/fixtures are
+# bind-mounted read-only at run time instead (compose.yaml).
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+data_files/
+build/
+dist/
+.claude/
+*.sqlite
+*.sqlite3
+*.mdb
+*.accdb
+*.ldb
+*.laccdb
+**/__pycache__
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+scripts/inspect/out/

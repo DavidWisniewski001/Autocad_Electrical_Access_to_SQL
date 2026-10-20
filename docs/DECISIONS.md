@@ -360,3 +360,63 @@ Each entry: decision — reason. Newest last.
     files keep working. `UnsupportedAccessFeature` moved to `acade2sql.errors` (re-exported from
     `acade2sql.readers.access_parser_reader`); it and `SourceIntegrityError` are exported from
     `acade2sql`.
+46. **Docker test environment layout** (M6) — `compose.yaml` (repo root) runs
+    `mcr.microsoft.com/mssql/server:2022-latest` (Developer edition, `ACCEPT_EULA=Y`),
+    `postgres:16-bookworm` and a `tests` runner built from `docker/Dockerfile`
+    (`python:3.12-slim-bookworm` + unixODBC + Microsoft ODBC Driver 18 via Microsoft's Debian 12
+    `packages-microsoft-prod.deb`, which installs the signing keyring and the `signed-by` apt
+    source; `ACCEPT_EULA=Y` only on the `apt-get install msodbcsql18` call; non-root user `acade`
+    uid 10001; `pip install .[dev,postgresql]`). Server ports are published on 127.0.0.1 only
+    (14330/54330 by default). The postgres healthcheck uses `pg_isready -h 127.0.0.1` because the
+    init-phase temporary server listens on the socket only, so the check cannot pass before
+    initialisation is complete. The mssql healthcheck uses `/opt/mssql-tools18/bin/sqlcmd -C` with
+    `$${MSSQL_SA_PASSWORD}` (expanded by the container shell, not by compose). Tests run as
+    `python -m pytest` (not `pytest`) so `/app` is on `sys.path` for `from tests.conftest import`.
+47. **Passwords: raw in compose, URLs built in the container** (M6) — compose passes only
+    `MSSQL_SA_PASSWORD` / `POSTGRES_PASSWORD` (`${VAR:?run scripts/docker_env.py ...}`, so a
+    missing `.env` fails fast). `docker/entrypoint.sh` (POSIX sh, `set -eu`) runs
+    `docker/db_setup.py`, which builds `ACADE2SQL_TEST_MSSQL_URL` / `ACADE2SQL_TEST_PG_URL`
+    (hosts `mssql`/`postgres`; `ACADE2SQL_{MSSQL,PG}_{HOST,PORT}` override them, deliberately not
+    `MSSQL_PORT`/`PG_PORT`, which are the host ports), waits up to `ACADE2SQL_WAIT_SECONDS`
+    (120) for both servers, creates database `acade2sql_test` on mssql (AUTOCOMMIT, `IF DB_ID(...)
+    IS NULL`) and schema `acade` on both, and prints `export` lines (shell-quoted) that the
+    entrypoint `eval`s before `exec "$@"`. Already-set URLs are kept; with
+    `ACADE2SQL_SKIP_DB_SETUP=1` nothing is contacted. The password is percent-encoded with
+    `urllib.parse.quote(pw, safe="")`, not `quote_plus` as M6_SPEC §1 says: SQLAlchemy decodes the
+    userinfo with `unquote`, so `quote_plus` would turn a space into a literal `+` (checked:
+    `'a b'` came back as `'a+b'`). db_setup asserts that `make_url(url).password` equals the raw
+    password and only ever logs masked URLs. The setup is a separate Python file (copied to
+    `/usr/local/lib/acade2sql-docker/`) rather than a heredoc so it can be linted and run on
+    Windows (`--urls-only`).
+48. **`scripts/docker_env.py`** (M6) — 24-character passwords from `secrets`, at least 2 each of
+    upper, lower, digit and the symbols `-_.!@%^*+=:,` (SQL Server policy needs 3 of 4 classes).
+    No `$` (compose interpolation), quotes, backslash, `#`, backtick or whitespace, and values
+    are single-quoted in `.env`, so they survive compose, the shell and URLs unchanged. The file
+    is created with `O_EXCL` (refuses to overwrite without `--force`), mode 0600 on POSIX, LF
+    endings; `--out PATH` writes elsewhere. Only the path is printed. Note: both servers apply
+    the password only when their volume is first initialised, so after `--force` run
+    `docker compose down -v`.
+49. **`scripts/e2e_live.py`** (M6, spec §4) — per target URL (`--targets`, default the two
+    `ACADE2SQL_TEST_*_URL`) and per source in `--data-dir`/`ACADE2SQL_DATA_DIR`: `full`
+    (pure reader, checksum) → tamper → `sync` → `sync --delete-missing` → `sync`, all through
+    `acade2sql.convert`, with `checksum=True` on every step. Expected: every table `pass` with
+    `checksum_match is True`; the tampered table `(inserted, updated, deleted, extra)` =
+    `(2, 3, 0, 1)`, then `(0, 0, 1, 0)`, then zeros; every other table all zeros (so spurious
+    updates anywhere are deviations). Tamper table: the smallest passing table with >= 10 rows, a
+    single-column PK (from the target's reflection), no other unique index/constraint, and a
+    text (else numeric) non-key column; 3 rows (lowest keys) get that column changed, the next 2
+    are deleted, and a copy of the first row is inserted with key max+1 (integer) or
+    `min(key)+'~e2e'` (text). The schema must match `^e2e\w*$` because it is dropped (all its
+    tables, then `DROP SCHEMA`, portable to mssql) before the run and at the end unless `--keep`.
+    SQLite targets (local smoke test) use no schema and drop the converted tables at the end; a
+    SQLite file inside the data directory is refused. The sources' size and mtime are compared
+    before and after. Exit 0 = all matched, 1 = any deviation, 2 = usage.
+50. **Linux behaviour of `doctor` and the driver messages** (M6 §2) — no import-time Windows
+    dependency existed (`winreg` was already imported inside the `sys.platform == "win32"`
+    guard; `ctypes` is not used). Changed: on non-Windows, `doctor` no longer shows the
+    "Access driver 32/64-bit" registry row and says "none found (the Access ODBC driver is
+    Windows-only; the pure reader is used)", and `missing_driver_message` replaces the
+    Windows-installer hint with "The Microsoft Access Database Engine and its ODBC driver are
+    Windows-only; on this platform (linux) use the pure-Python reader (--reader pure, which
+    --reader auto selects automatically)" (the head sentence with the bitness is unchanged).
+    Windows output is unchanged.

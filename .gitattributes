@@ -1,0 +1,11 @@
+# Shell scripts and everything copied into the Linux test-runner image must keep LF endings,
+# otherwise "/bin/sh^M: not found" inside the container (docs/M6_SPEC.md).
+*.sh text eol=lf
+docker/* text eol=lf
+compose.yaml text eol=lf
+.env.example text eol=lf
+.dockerignore text eol=lf
+
+# Never touch binary Access databases or test fixtures
+*.mdb binary
+*.accdb binary

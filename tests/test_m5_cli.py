@@ -307,6 +307,8 @@ def test_tables_file_real_comma_table(capsys, tmp_path, mdb_db):
 # ---------------------------------------------------------------------------------- doctor
 
 
+# Expects "usable readers: odbc, pure"; the Linux test container has no Access driver.
+@pytest.mark.requires_driver
 def test_doctor_reports_sections_and_exits_0(capsys):
     rc, out, err = run(capsys, "doctor")
     text = out + err

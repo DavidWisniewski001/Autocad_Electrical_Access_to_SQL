@@ -1,0 +1,82 @@
+# Live SQL Server + PostgreSQL test environment for acade2sql (docs/M6_SPEC.md).
+#
+#   python scripts/build_test_fixtures.py     # Windows, needs the Access driver -> build/fixtures
+#   python scripts/docker_env.py              # writes .env with random passwords
+#   docker compose run --rm tests             # live tests + scripts/e2e_live.py
+#   docker compose down -v                    # stop and delete the server volumes
+#
+# SQL Server runs as the Developer edition (ACCEPT_EULA=Y): free for development and testing,
+# not licensed for production. Host ports are published on 127.0.0.1 only.
+name: acade2sql
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run scripts/docker_env.py to create .env}
+    ports:
+      - "127.0.0.1:${MSSQL_PORT:-14330}:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      # $$ = a literal $ for the container's shell (no compose interpolation, password not in
+      # the compose config); -C trusts the self-signed certificate (ODBC Driver 18 defaults).
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$${MSSQL_SA_PASSWORD}" -C -b -l 5 -Q "SELECT 1" -o /dev/null
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/docker_env.py to create .env}
+      POSTGRES_DB: acade2sql_test
+    ports:
+      - "127.0.0.1:${PG_PORT:-54330}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1: the temporary server of the init phase listens on the socket only, so
+      # the check cannot pass before the init scripts are done.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d acade2sql_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  tests:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: acade2sql-tests:local
+    depends_on:
+      mssql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      # Raw passwords only: docker/entrypoint.sh builds the percent-encoded
+      # ACADE2SQL_TEST_MSSQL_URL / ACADE2SQL_TEST_PG_URL from them (hosts mssql / postgres).
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run scripts/docker_env.py to create .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/docker_env.py to create .env}
+      ACADE2SQL_TEST_FIXTURE_DIR: /fixtures
+      ACADE2SQL_DATA_DIR: /data
+      ACADE2SQL_WAIT_SECONDS: "120"
+    # Short syntax on purpose: a missing ./build/fixtures is created empty (the fixture-based
+    # live tests then skip with a reason) instead of failing the whole run.
+    volumes:
+      - ./data_files:/data:ro
+      - ./build/fixtures:/fixtures:ro
+    command:
+      - sh
+      - -c
+      - python -m pytest -p no:cacheprovider -m live_db -q && python scripts/e2e_live.py
+
+volumes:
+  mssql-data:
+  pg-data:
