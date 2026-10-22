@@ -6,8 +6,20 @@ All notable changes to acade2sql are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet. Still open from the plan: verification of the SQL Server and PostgreSQL targets
-against live servers, and a test with a real ACADE project database.
+### Added
+- **Desktop window** (milestone M7): `acade2sql-gui` (gui-script, no console), `acade2sql gui` and
+  `python -m acade2sql.gui`. tkinter/ttk only, no new dependency. Source and target pickers (SQLite
+  file, SQL Server and PostgreSQL connection fields, or a custom URL), every convert option, Dry
+  run (plan and DDL), Convert, Check setup (`doctor`), List tables, per-table progress, results
+  table, log pane, Cancel and Save report. Work runs in a background thread; passwords are masked
+  wherever a URL or error is shown. See [USAGE.md](USAGE.md#use-the-desktop-window).
+- `convert()` hooks, backwards compatible (the CLI does not use them):
+  `table_started(name, index, total)` before each table, and `cancel()` polled before each table and
+  after each source batch; cancelled tables get `status="error"`, `error="cancelled by user"`.
+- `acade2sql.converter.sqlite_url(path)`: public name of the SQLite URL helper.
+
+Still open from the plan: verification of the SQL Server and PostgreSQL targets against live
+servers, and a test with a real ACADE project database.
 
 ## [0.3.0] - 2026-10-19
 

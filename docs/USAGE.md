@@ -10,6 +10,7 @@ Where a target had to be "out of date", a copy of the SQLite target was edited w
 `sqlite3`; the Access source was never changed. SQL Server and PostgreSQL examples use `--dry-run`
 with placeholder credentials and did not connect to any server.
 
+- [Use the desktop window](#use-the-desktop-window)
 - [Check your machine with doctor](#check-your-machine-with-doctor)
 - [Convert on a machine without the Access driver](#convert-on-a-machine-without-the-access-driver)
 - [Choose a reader](#choose-a-reader)
@@ -45,6 +46,39 @@ the ODBC reader reads, the Access driver creates a temporary lock file next to t
 [Avoid the lock file](#avoid-the-lock-file-with---copy-to-temp)). That lock file is the only thing
 created next to the source, and it is removed when the run ends. The pure reader creates nothing
 next to the source.
+
+## Use the desktop window
+
+`acade2sql-gui` opens a window that does what `convert` and `doctor` do (also `acade2sql gui` or
+`python -m acade2sql.gui`). It is installed with the package; on Windows `acade2sql-gui.exe` starts
+without a console window.
+
+1. **Source**: *Browse...* to the `.mdb` / `.accdb` file. The SQLite target path follows it
+   (`<folder>\<name>.sqlite`) until you change it.
+2. **Target**: *SQLite file*, *SQL Server* (host, optional instance and port, database, user and
+   password or *Windows login*, ODBC driver, *Trust server certificate*), *PostgreSQL* (host, port
+   5432 by default, database, user, password, SSL mode) or *Custom URL* (any SQLAlchemy URL; hidden
+   while typing unless *Show* is ticked). The line under the fields shows the resulting URL with
+   the password replaced by `***`.
+3. **Options**: mode, reader, batch size, *Copy source to temp* (`--copy-to-temp`), *Checksum*,
+   *Count rows in dry run* (off = `--no-counts`), table names to convert or exclude
+   (comma-separated), schema, report JSON path. The sync fields (keys separated by `;`, *Table
+   without key*, *Delete missing rows*) are only enabled in `sync` mode.
+4. **Check setup** runs `doctor` (tab *Setup check*). **List tables...** reads the table names and
+   lets you copy a selection into *Tables* or *Exclude*.
+5. **Dry run** fills the results table with the planned actions and shows the plan and DDL in the
+   *Plan / DDL* tab; nothing is written. **Convert** runs the conversion; `full` mode asks for
+   confirmation when the target already exists (its tables are dropped and re-created).
+6. While it runs, each table appears as `RUNNING`, then `PASS` / `FAIL` / `ERROR` with its row
+   counts, changes, checksum and warning count. Double-click a row for the warnings and the full
+   error. The *Log* tab shows the log (*Verbose log* adds debug lines).
+7. **Cancel** stops after the current batch: the table in progress and the remaining tables get
+   `ERROR` with `cancelled by user` (a `sync` table is rolled back, a `full` table is left
+   partial). **Save report...** writes the JSON report of the last run, the same document as
+   `--report`.
+
+Errors such as a missing driver or a password-protected database are shown in a message box and
+the log, with any password masked.
 
 ## Check your machine with doctor
 
@@ -835,8 +869,14 @@ WIRENO pass 3 3 True
 - `convert()` takes the same options as the CLI: `mode="full"` (or `"append"`, `"sync"`), `tables`,
   `exclude`, `batch_size=5000`, `checksum=False`, `copy_to_temp=False`, `report_path=None`,
   `key=None` (a string or a list of `--key` specs), `no_key="error"`, `delete_missing=False`,
-  `schema=None`, `dry_run=False`, `counts=True`, `reader="auto"` (or `"odbc"`, `"pure"`) and
-  `progress=None`. `report.reader` is the reader that was used.
+  `schema=None`, `dry_run=False`, `counts=True`, `reader="auto"` (or `"odbc"`, `"pure"`),
+  `progress=None`, `table_started=None` and `cancel=None`. `report.reader` is the reader that was
+  used.
+- `table_started(name, index, total)` is called before each table of a real run. `cancel()` is
+  polled before each table and after each source batch; once it returns `True` the table in
+  progress and all later tables get `status="error"`, `error="cancelled by user"`, and `convert()`
+  returns the report as usual (the desktop window's Cancel button uses this). Neither is used by
+  a dry run.
 - `progress` is a function called after each table of a real run with `(result, index, total)`:
 
   ```python

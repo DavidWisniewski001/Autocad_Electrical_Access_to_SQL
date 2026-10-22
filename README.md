@@ -146,6 +146,19 @@ value, both readers):
 The 260 rows of `default_cat.mdb` table `MS` that contain `–` (U+2013) are read correctly, and
 `acade2sql convert default_cat.mdb --reader pure --checksum` passes all 168 tables.
 
+### Unreleased (milestone M7): desktop window
+
+- `acade2sql-gui` (or `acade2sql gui`, or `python -m acade2sql.gui`) opens a tkinter window: pick
+  the Access file, pick a SQLite file or fill in SQL Server / PostgreSQL connection fields (or
+  paste a URL), set mode, reader, checksum, table filters, schema and report path, then **Dry run**
+  (plan and DDL) or **Convert**. **Check setup** runs `doctor`; **List tables...** lets you pick
+  tables to include or exclude.
+- Work runs in the background: per-table progress and a results table (status, rows, changes,
+  checksum, warnings, error; double-click a row for details), a log pane, **Cancel** (stops after
+  the current batch) and **Save report...**. Passwords are masked in everything the window shows.
+- Uses the same Python API as the CLI; no extra dependency (tkinter ships with Python on Windows).
+  See [Use the desktop window](docs/USAGE.md#use-the-desktop-window).
+
 ## Requirements
 
 - **Windows**. Tested on Windows 11 only. (The Access ODBC driver is Windows-only. The pure reader
@@ -570,6 +583,7 @@ More: [usage guide](docs/USAGE.md#fix-access-odbc-driver-was-not-found),
 | M1 to M3 | Schema inventory, reader and `inspect`, SQLite `convert` | Done (0.1.0) |
 | M4 | SQL Server and PostgreSQL targets, `append` / `sync`, `--dry-run` | Done (0.2.0) |
 | M5 | Pure-Python reader, `--reader`, `doctor`, progress, table list files, `compare_readers.py` | Done (0.3.0) |
+| M7 | Desktop window (`acade2sql-gui`) | Done (unreleased) |
 
 Still open (**not available in 0.3.0**):
 

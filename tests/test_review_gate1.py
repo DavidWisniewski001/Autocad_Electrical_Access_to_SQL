@@ -125,9 +125,10 @@ def test_convert_is_a_plain_function_and_old_module_is_gone():
     assert list(params) == [
         "source", "target", "mode", "tables", "exclude", "batch_size", "checksum",
         "copy_to_temp", "report_path", "key", "no_key", "delete_missing", "schema", "dry_run",
-        "counts", "reader", "progress",
+        "counts", "reader", "progress", "table_started", "cancel",
     ]  # fmt: skip
     assert params["reader"].default == "auto" and params["progress"].default is None
+    assert params["table_started"].default is None and params["cancel"].default is None
     assert params["mode"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["report_path"].kind is inspect.Parameter.KEYWORD_ONLY
     assert importlib.util.find_spec("acade2sql.converter") is not None

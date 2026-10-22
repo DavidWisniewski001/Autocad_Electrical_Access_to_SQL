@@ -14,6 +14,7 @@ examples, see the [usage guide](USAGE.md).
   - [Option combinations](#option-combinations)
   - [convert console output](#convert-console-output)
 - [acade2sql doctor](#acade2sql-doctor)
+- [acade2sql gui](#acade2sql-gui)
 - [scripts/compare_readers.py](#scriptscompare_readerspy)
 - [Target resolution](#target-resolution)
 - [Exit codes](#exit-codes)
@@ -549,6 +550,16 @@ The `usable readers` line names the reader `--reader auto` would pick.
 |---|---|
 | `0` | At least one Access reader is usable. A `--` line for a target driver does not change the exit code. |
 | `1` | No Access reader is usable (`usable readers: none (install the Access ODBC driver or access-parser)`). |
+
+## acade2sql gui
+
+Open the desktop window (same as the `acade2sql-gui` command and `python -m acade2sql.gui`). It takes
+no options besides `-h` / `-v` and returns `0` when the window is closed, `1` when Tk cannot start.
+See [Use the desktop window](USAGE.md#use-the-desktop-window).
+
+```text
+usage: acade2sql gui [-h] [-v]
+```
 
 ## scripts/compare_readers.py
 

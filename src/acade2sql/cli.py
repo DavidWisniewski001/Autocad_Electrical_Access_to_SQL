@@ -1,4 +1,4 @@
-"""Command-line interface: ``acade2sql inspect``, ``convert`` and ``doctor``."""
+"""Command-line interface: ``acade2sql inspect``, ``convert``, ``doctor`` and ``gui``."""
 
 from __future__ import annotations
 
@@ -175,6 +175,7 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="check Python, the Access readers and the target drivers on this machine",
     )
+    sub.add_parser("gui", parents=[common], help="open the desktop window (acade2sql-gui)")
     return parser
 
 
@@ -366,6 +367,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from acade2sql import doctor
 
             return doctor.run(sys.stdout)
+        if args.command == "gui":
+            from acade2sql.gui import main as gui_main
+
+            return gui_main()
         return _cmd_convert(args, sys.stdout)
     except UsageError as exc:
         sys.stderr.write(f"error: {redact(str(exc), getattr(args, 'target', None))}\n")

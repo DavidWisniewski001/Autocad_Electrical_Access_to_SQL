@@ -27,6 +27,9 @@ mssql = []
 [project.scripts]
 acade2sql = "acade2sql.cli:main"
 
+[project.gui-scripts]
+acade2sql-gui = "acade2sql.gui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

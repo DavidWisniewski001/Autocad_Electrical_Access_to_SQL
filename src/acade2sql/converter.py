@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy.engine import URL, make_url
@@ -36,13 +37,22 @@ log = logging.getLogger(__name__)
 TARGET_ENV = "ACADE2SQL_TARGET"
 #: ``progress(result, index, total)``: called after each table of a real run (1-based index).
 Progress = Callable[[TableResult, int, int], None]
+#: ``table_started(name, index, total)``: called before each table of a real run (1-based index).
+TableStarted = Callable[[str, int, int], None]
+#: ``cancel()``: polled before each table and after each source batch of a real run; once it
+#: returns True the run stops (see :func:`convert`).
+Cancel = Callable[[], bool]
+CANCELLED = "cancelled by user"
 SQLITE_SUFFIXES = frozenset({".sqlite", ".db", ".sqlite3"})
 
 
-def _sqlite_url(path: Path) -> str:
+def sqlite_url(path: str | Path) -> str:
     """``sqlite:///`` URL for ``path`` (absolute). The path is escaped, never URL-decoded."""
-    url = URL.create("sqlite", database=str(path.expanduser().resolve()))
+    url = URL.create("sqlite", database=str(Path(path).expanduser().resolve()))
     return url.render_as_string(hide_password=False)
+
+
+_sqlite_url = sqlite_url  # pre-0.4 private name
 
 
 def _path_to_url(target: str) -> str:
@@ -88,8 +98,40 @@ def select_tables(
     return selected
 
 
+class RunCancelled(Exception):
+    """Raised between source batches when the ``cancel`` callback of :func:`convert` fires."""
+
+    def __init__(self) -> None:
+        super().__init__(CANCELLED)
+
+
+class _CancellableReader:
+    """Delegating reader proxy whose :meth:`iter_rows` stops once ``cancel()`` is True."""
+
+    def __init__(self, reader: Reader, cancel: Cancel) -> None:
+        self._reader = reader
+        self._cancel = cancel
+
+    def iter_rows(self, name: str, batch_size: int = 5000):  # type: ignore[no-untyped-def]
+        for batch in self._reader.iter_rows(name, batch_size):
+            if self._cancel():
+                raise RunCancelled()
+            yield batch
+
+    def __getattr__(self, attr: str):  # type: ignore[no-untyped-def]
+        return getattr(self._reader, attr)
+
+
+def _cancelled_result(name: str) -> TableResult:
+    return TableResult(name, None, None, "error", error=CANCELLED)
+
+
 def _convert_table(
-    reader: Reader, writer: SqlAlchemyWriter, info: TableInfo, opts: RunOptions
+    reader: Reader,
+    writer: SqlAlchemyWriter,
+    info: TableInfo,
+    opts: RunOptions,
+    cancel: Cancel | None = None,
 ) -> TableResult:
     """Run the mode for one table; every failure becomes ``status="error"``."""
     started = time.perf_counter()
@@ -103,7 +145,7 @@ def _convert_table(
             res.status = "fail"
     except Exception as exc:
         res.status = "error"
-        res.error = error_text(exc, writer.url)
+        res.error = CANCELLED if cancel is not None and cancel() else error_text(exc, writer.url)
         res.seconds = time.perf_counter() - started
         log.error("table failed", extra={"kv": {"table": info.name, "error": res.error}})
         return res
@@ -193,6 +235,8 @@ def convert(
     counts: bool = True,
     reader: ReaderChoice = "auto",
     progress: Progress | None = None,
+    table_started: TableStarted | None = None,
+    cancel: Cancel | None = None,
 ) -> Report:
     """Convert ``source`` to ``target`` (see :func:`resolve_target`) and return the report.
 
@@ -203,7 +247,13 @@ def convert(
     ``schema``: target schema (not SQLite). ``dry_run``: plan + DDL, no target connection
     (``counts=False`` skips the source row counts). ``reader``: ``auto`` (ODBC driver if usable,
     else the pure-Python reader with a warning), ``odbc`` or ``pure``; the report records the one
-    used. ``progress``: called with ``(result, index, total)`` after each table of a real run.
+    used. ``progress``: called with ``(result, index, total)`` after each table of a real run;
+    ``table_started``: called with ``(name, index, total)`` before each table of a real run.
+    ``cancel``: polled before each table and after each source batch of a real run; once it
+    returns True the current table and every table not yet started get ``status="error"`` with
+    ``error="cancelled by user"`` (the current table keeps what its mode had committed: ``full``
+    leaves a partial table, ``sync`` is rolled back) and the report is returned as usual.
+    ``progress`` is still called for every table. Not polled by ``dry_run``.
 
     Invalid option combinations raise :class:`UsageError` (a ``ValueError``) before anything
     is opened. Acade2SqlError subclasses raised before the target is modified (bad source,
@@ -238,7 +288,8 @@ def convert(
             )
             results.extend(planned)
         else:
-            results.extend(_write_all(source_reader, infos, url, opts, schema, progress))
+            hooks = _Hooks(progress, table_started, cancel)
+            results.extend(_write_all(source_reader, infos, url, opts, schema, hooks))
             masked = mask_url(url)
     order = {n: i for i, n in enumerate(names)}
     results.sort(key=lambda r: order.get(r.name, len(order)))
@@ -259,14 +310,27 @@ def convert(
     return report
 
 
+@dataclass(frozen=True)
+class _Hooks:
+    progress: Progress | None = None
+    table_started: TableStarted | None = None
+    cancel: Cancel | None = None
+
+    def cancelled(self) -> bool:
+        return self.cancel is not None and bool(self.cancel())
+
+
 def _write_all(
     reader: Reader,
     infos: Sequence[TableInfo],
     url: str,
     opts: RunOptions,
     schema: str | None,
-    progress: Progress | None = None,
+    hooks: _Hooks | None = None,
 ) -> list[TableResult]:
+    hooks = hooks or _Hooks()
+    if hooks.cancel is not None:
+        reader = _CancellableReader(reader, hooks.cancel)  # type: ignore[assignment]
     with SqlAlchemyWriter(url, schema=schema) as writer:
         log.info(
             "converting",
@@ -284,9 +348,19 @@ def _write_all(
         if infos:
             writer.prepare(infos, mode=opts.mode)  # no DDL; TargetError if unreachable
         results = []
+        total = len(infos)
+        stopped = False
         for index, info in enumerate(infos, 1):
-            res = _convert_table(reader, writer, info, opts)
+            if hooks.cancelled():
+                if not stopped:
+                    log.warning("run cancelled", extra={"kv": {"remaining": total - index + 1}})
+                    stopped = True
+                res = _cancelled_result(info.name)
+            else:
+                if hooks.table_started is not None:
+                    hooks.table_started(info.name, index, total)
+                res = _convert_table(reader, writer, info, opts, hooks.cancel)
             results.append(res)
-            if progress is not None:
-                progress(res, index, len(infos))
+            if hooks.progress is not None:
+                hooks.progress(res, index, total)
         return results
