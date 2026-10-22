@@ -151,11 +151,12 @@ def _key_column(engine: Engine, name: str, schema: str | None) -> str | None:
         for ix in insp.get_indexes(name, schema=schema)
         if ix.get("unique") and list(ix.get("column_names") or []) != pk
     ]
-    others += [
-        uc
-        for uc in insp.get_unique_constraints(name, schema=schema)
-        if list(uc.get("column_names") or []) != pk
-    ]
+    try:
+        uniques = insp.get_unique_constraints(name, schema=schema)
+    except NotImplementedError:
+        # SQLAlchemy's mssql dialect: unique constraints are backed by indexes, already listed.
+        uniques = []
+    others += [uc for uc in uniques if list(uc.get("column_names") or []) != pk]
     return None if others else pk[0]
 
 
